@@ -868,6 +868,7 @@ _import_structure = {
         "TrOCRConfig",
         "TrOCRProcessor",
     ],
+    "models.ttt": ["TTTConfig"],
     "models.tvlt": [
         "TVLT_PRETRAINED_CONFIG_ARCHIVE_MAP",
         "TvltConfig",
@@ -3494,6 +3495,13 @@ else:
             "TrOCRPreTrainedModel",
         ]
     )
+    _import_structure["models.ttt"].extend(
+        [
+            "TttForCausalLM",
+            "TttModel",
+            "TttPreTrainedModel",
+        ]
+    )
     _import_structure["models.tvlt"].extend(
         [
             "TVLT_PRETRAINED_MODEL_ARCHIVE_LIST",
@@ -5769,6 +5777,7 @@ if TYPE_CHECKING:
         TrOCRConfig,
         TrOCRProcessor,
     )
+    from .models.ttt import TttConfig
     from .models.tvlt import (
         TVLT_PRETRAINED_CONFIG_ARCHIVE_MAP,
         TvltConfig,
@@ -8015,6 +8024,11 @@ if TYPE_CHECKING:
             TROCR_PRETRAINED_MODEL_ARCHIVE_LIST,
             TrOCRForCausalLM,
             TrOCRPreTrainedModel,
+        )
+        from .models.ttt import (
+            TttForCausalLM,
+            TttModel,
+            TttPreTrainedModel,
         )
         from .models.tvlt import (
             TVLT_PRETRAINED_MODEL_ARCHIVE_LIST,

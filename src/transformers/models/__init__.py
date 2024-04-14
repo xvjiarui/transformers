@@ -227,6 +227,7 @@ from . import (
     timesformer,
     timm_backbone,
     trocr,
+    ttt,
     tvlt,
     tvp,
     udop,
