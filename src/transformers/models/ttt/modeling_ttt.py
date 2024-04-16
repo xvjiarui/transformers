@@ -337,6 +337,60 @@ class TttBaseModule(nn.Module):
         return output_hidden_states
 
 
+class TTTLayerNormModule(torch.nn.Module):
+    def __init__(self, features, eps=1e-5):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(torch.ones(features))
+        self.beta = torch.nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, input, label):
+        D = input.shape[-1]
+        mu = input.mean(dim=1, keepdim=True)
+        var = input.var(dim=1, keepdim=True, unbiased=False)
+
+        std = torch.sqrt(var + self.eps)
+        x_hat = (input - mu) / std
+        y = self.gamma * x_hat + self.beta
+
+        grad_output = y - label
+        grad_x_hat = grad_output * self.gamma
+        z = (
+            (1.0 / D)
+            * (
+                D * grad_x_hat
+                - grad_x_hat.sum(dim=1, keepdim=True)
+                - x_hat * (grad_x_hat * x_hat).sum(dim=1, keepdim=True)
+            )
+            / std
+        )
+
+        return z
+
+def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
+    D = input.shape[-1]
+    mu = input.mean(dim=1, keepdim=True)
+    var = input.var(dim=1, keepdim=True, unbiased=False)
+
+    std = torch.sqrt(var + eps)
+    x_hat = (input - mu) / std
+    y = gamma * x_hat + beta
+
+    grad_output = y - label
+    grad_x_hat = grad_output * gamma
+    z = (
+        (1.0 / D)
+        * (
+            D * grad_x_hat
+            - grad_x_hat.sum(dim=1, keepdim=True)
+            - x_hat * (grad_x_hat * x_hat).sum(dim=1, keepdim=True)
+        )
+        / std
+    )
+
+    return z
+    
+
 class TttM1Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -387,12 +441,15 @@ class TttM1Module(TttBaseModule):
                     X1 = XB_chunk
                     Z1 = X1 @ W1_init + b1_init
 
-                    DLN_out, LN_vjp = torch.func.vjp(
-                        lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
-                    )
+                    if self.config.use_vjp:
+                        DLN_out, LN_vjp = torch.func.vjp(
+                            lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
+                        )
+                        grad_l_wrt_DLN_out = DLN_out - XA_chunk  # [K,f]
+                        grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
+                    else:
+                        grad_l_wrt_Z1 = decoder_ln_bwd(Z1, XA_chunk, ln_weight, ln_bias)
 
-                    grad_l_wrt_DLN_out = DLN_out - XA_chunk  # [K,f]
-                    grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
                     # NOTE: fractional forward, caching the gradients, and cumsum from cache
                     if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
                         # [K, C, C]

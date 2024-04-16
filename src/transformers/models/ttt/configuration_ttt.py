@@ -132,6 +132,7 @@ class TttConfig(PretrainedConfig):
         tie_word_embeddings=False,
         inner_net_lr=1.0,
         inner_net_chunk_size=16,
+        use_vjp=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -149,6 +150,8 @@ class TttConfig(PretrainedConfig):
 
         self.inner_net_lr = inner_net_lr
         self.inner_net_chunk_size = inner_net_chunk_size
+
+        self.use_vjp = use_vjp
 
         super().__init__(
             pad_token_id=pad_token_id,
