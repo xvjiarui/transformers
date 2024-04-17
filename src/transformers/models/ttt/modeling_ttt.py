@@ -337,36 +337,6 @@ class TttBaseModule(nn.Module):
         return output_hidden_states
 
 
-class TTTLayerNormModule(torch.nn.Module):
-    def __init__(self, features, eps=1e-5):
-        super().__init__()
-        self.gamma = torch.nn.Parameter(torch.ones(features))
-        self.beta = torch.nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, input, label):
-        D = input.shape[-1]
-        mu = input.mean(dim=1, keepdim=True)
-        var = input.var(dim=1, keepdim=True, unbiased=False)
-
-        std = torch.sqrt(var + self.eps)
-        x_hat = (input - mu) / std
-        y = self.gamma * x_hat + self.beta
-
-        grad_output = y - label
-        grad_x_hat = grad_output * self.gamma
-        z = (
-            (1.0 / D)
-            * (
-                D * grad_x_hat
-                - grad_x_hat.sum(dim=1, keepdim=True)
-                - x_hat * (grad_x_hat * x_hat).sum(dim=1, keepdim=True)
-            )
-            / std
-        )
-
-        return z
-
 def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
     D = input.shape[-1]
     mu = input.mean(dim=1, keepdim=True)
@@ -441,14 +411,19 @@ class TttM1Module(TttBaseModule):
                     X1 = XB_chunk
                     Z1 = X1 @ W1_init + b1_init
 
+                    if self.config.inner_net_on_residual:
+                        reconstruction_target = XA_chunk - XB_chunk
+                    else:
+                        reconstruction_target = XA_chunk
+
                     if self.config.use_vjp:
                         DLN_out, LN_vjp = torch.func.vjp(
                             lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
                         )
-                        grad_l_wrt_DLN_out = DLN_out - XA_chunk  # [K,f]
+                        grad_l_wrt_DLN_out = DLN_out - reconstruction_target  # [K,f]
                         grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
                     else:
-                        grad_l_wrt_Z1 = decoder_ln_bwd(Z1, XA_chunk, ln_weight, ln_bias)
+                        grad_l_wrt_Z1 = decoder_ln_bwd(Z1, reconstruction_target, ln_weight, ln_bias)
 
                     # NOTE: fractional forward, caching the gradients, and cumsum from cache
                     if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
@@ -464,7 +439,6 @@ class TttM1Module(TttBaseModule):
                         Z1_bar = (XC_chunk.unsqueeze(1) @ (W1_init - coeff_chunk.unsqueeze(-1) * grad_W1)).squeeze(
                             1
                         ) + b1_bar
-                        XCW_chunk = Z1_bar
 
                         W1_last = W1_init - (coeff_chunk[-1] * grad_W1[-1])
                         b1_last = b1_bar[-1:]
@@ -480,7 +454,6 @@ class TttM1Module(TttBaseModule):
                         Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(1, 0))
                         b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=0)  # [K,f]
                         Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar
-                        XCW_chunk = Z1_bar
 
                         W1_last = W1_init - (coeff_chunk[-1] * X1).transpose(1, 0) @ grad_l_wrt_Z1
                         b1_last = b1_bar[-1:]
@@ -491,6 +464,14 @@ class TttM1Module(TttBaseModule):
                             "W1_grad": torch.zeros_like(W1_init),
                             "b1_grad": torch.zeros_like(b1_init),
                         }
+                    if self.config.use_post_ln:
+                        # TODO: accuracy is slightly off, need to investigate later
+                        Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
+
+                    if self.config.inner_net_on_residual:
+                        XCW_chunk = XC_chunk + Z1_bar
+                    else:
+                        XCW_chunk = Z1_bar
 
                     return last_param_dic, XCW_chunk
 
@@ -905,3 +886,16 @@ class TttForCausalLM(TttPreTrainedModel):
             cache_params=outputs.cache_params,
             hidden_states=outputs.hidden_states,
         )
+
+
+if __name__ == "__main__":
+    from .configuration_ttt import TTT_STANDARD_CONFIGS
+    # 125M
+    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS["125m"])
+    ttt_model = TttForCausalLM(ttt_config)
+    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))
+    
+    # 1.3B
+    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS["1b"])
+    ttt_model = TttForCausalLM(ttt_config)
+    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))

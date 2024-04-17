@@ -25,7 +25,23 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-TTT_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+
+TTT_STANDARD_CONFIGS = {
+    "1b": {
+        "hidden_size": 2048,
+        "intermediate_size": 5504,
+        "num_hidden_layers": 22,
+        "num_attention_heads": 16,
+        "rms_norm_eps": 1e-6,
+    },
+    "125m": {
+        "hidden_size": 768,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12,
+        "rms_norm_eps": 1e-6,
+    },
+}
 
 
 class TttConfig(PretrainedConfig):
@@ -115,7 +131,7 @@ class TttConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
+        vocab_size=50277,
         hidden_size=4096,
         intermediate_size=11008,
         num_hidden_layers=32,
@@ -124,15 +140,17 @@ class TttConfig(PretrainedConfig):
         max_position_embeddings=2048,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
-        use_cache=True,
+        use_cache=False,
         pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
+        bos_token_id=0,
+        eos_token_id=0,
         pretraining_tp=1,
         tie_word_embeddings=False,
         inner_net_lr=1.0,
         inner_net_chunk_size=16,
         use_vjp=True,
+        use_post_ln=False,
+        inner_net_on_residual=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -152,6 +170,8 @@ class TttConfig(PretrainedConfig):
         self.inner_net_chunk_size = inner_net_chunk_size
 
         self.use_vjp = use_vjp
+        self.use_post_ln = use_post_ln
+        self.inner_net_on_residual = inner_net_on_residual
 
         super().__init__(
             pad_token_id=pad_token_id,
