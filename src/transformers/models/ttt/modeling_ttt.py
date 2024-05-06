@@ -11,7 +11,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
-from ...activations import ACT2FN
+from ...activations import ACT2FN as _ACT2FN
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -19,13 +19,31 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
+from ...utils.import_utils import is_causal_conv1d_available
 from .configuration_ttt import TttConfig
 
+
+class Clamp(nn.Module):
+    def __init__(self, max_val):
+        super().__init__()
+        self.max_val = max_val
+    def forward(self, x):
+        return x.clamp(min=0, max=self.max_val)
+
+ACT2FN = {
+    "softplus": nn.Softplus(),
+    "softplus_clip_5": nn.Sequential(nn.Softplus(), Clamp(max_val=5)),
+    **_ACT2FN,
+}
 
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "TttConfig"
 
+if is_causal_conv1d_available():
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+else:
+    causal_conv1d_update, causal_conv1d_fn = None, None
 
 class TttCache:
     def __init__(self, config, batch_size, dtype=torch.float32, device=None):
@@ -114,6 +132,38 @@ class TttMLP(nn.Module):
 
         return down_proj
 
+class TttConv(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.norm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.conv = nn.Conv1d(
+            config.hidden_size,
+            config.hidden_size,
+            bias=True,
+            kernel_size=config.conv_kernel,
+            groups=config.hidden_size,
+            padding=config.conv_kernel - 1,
+        )
+
+    def __call__(self, x, cache_params=None):
+        seq_len = x.shape[1]
+        x = self.norm(x)
+
+        # [B, C, L]
+        x = x.transpose(1, 2)
+
+        assert cache_params is None
+        if causal_conv1d_fn is None:
+            x = self.conv(x)[..., :seq_len]
+        else:
+            conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
+            x = causal_conv1d_fn(x, conv_weights, self.conv.bias, activation=None)
+
+        return x
+
 
 # Function to unpack tensors along the first dimension
 def unpack_tensors(tensor_dict):
@@ -145,6 +195,77 @@ def scan(f, init, xs, length=None):
     return carry, torch.stack(ys)
 
 
+class LayerNormFunction(torch.autograd.Function):
+    generate_vmap_rule = True
+    @staticmethod
+    def forward(input, gamma, beta, eps):
+        N, D = input.shape
+
+        # Mean and variance computation
+        mu = input.mean(dim=-1, keepdim=True)
+        var = input.var(dim=-1, keepdim=True, unbiased=False)
+
+        # Normalization
+        std = torch.sqrt(var + eps)
+        x_hat = (input - mu) / std
+
+        # Scale and shift
+        y = gamma * x_hat + beta
+
+        # Save variables for backward pass
+        # ctx.save_for_backward(x_hat, gamma, std)
+        # ctx.eps = eps
+
+        return y, x_hat, std
+    
+    @staticmethod
+    def setup_context(ctx: Any, inputs: Tuple[Any], output: Any) -> Any:
+        x, gamma, beta, eps = inputs
+        y, x_hat, std = output
+        ctx.save_for_backward(x_hat, gamma, std)
+        ctx.eps = eps
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_x_hat_, grad_std_):
+        x_hat, gamma, std = ctx.saved_tensors
+        N, D = grad_output.shape
+
+        # Gradients for gamma and beta
+        grad_gamma = (grad_output * x_hat).sum(dim=0)
+        grad_beta = grad_output.sum(dim=0)
+
+        # Gradient w.r.t. normalized data
+        grad_x_hat = grad_output * gamma
+
+        # Backpropagation through normalization
+        grad_input = (
+            (1 / D)
+            * (
+                D * grad_x_hat
+                - grad_x_hat.sum(dim=-1, keepdim=True)
+                - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
+            )
+            / std
+        )
+
+        return grad_input, grad_gamma, grad_beta, None
+
+def ttt_layer_norm(input, weight, bias, eps=1e-6):
+    return LayerNormFunction.apply(input, weight, bias, eps)[0]
+
+
+# Usage
+class TttLayerNorm(torch.nn.Module):
+    def __init__(self, features, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(features))
+        self.bias = torch.nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, input):
+        return ttt_layer_norm(input, self.weight, self.bias, self.eps)
+
+
 class TttBaseModule(nn.Module):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -164,17 +285,23 @@ class TttBaseModule(nn.Module):
 
         token_idx = 1.0 / torch.arange(1, self.inner_chunk_size + 1)
         self.register_buffer("token_idx", token_idx, persistent=False)
+        if self.config.use_learnable_token_idx:
+            self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size, self.inner_chunk_size)))
 
-        self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        # self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        # self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        # self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        # self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        self.init_qkvo_proj()
 
-        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
+        # self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
+        self.decoder_ln_fn = ttt_layer_norm
         # prepending head dim
-        ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
+        # ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
+        ln_weight_data = TttLayerNorm(self.head_dim).weight.data
         self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.unsqueeze(0), (self.num_heads, 1)))
-        ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
+        # ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
+        ln_bias_data = TttLayerNorm(self.head_dim).bias.data
         self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (self.num_heads, 1)))
 
         self.gate_ilr_fn = F.linear
@@ -188,6 +315,12 @@ class TttBaseModule(nn.Module):
         self.linear_bias = nn.Parameter(
             torch.stack([torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)], dim=0)
         )
+
+    def init_qkvo_proj(self):
+        self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -203,6 +336,30 @@ class TttBaseModule(nn.Module):
             0, 3, 1, 2, 4
         )  # [B,nh,n_chunk,K,f]
         return hidden_states
+
+    def get_coeff(self, X, inner_chunk_step_offset, inner_chunk_size):
+        # [B, num_heads, n_chunk, inner_chunk_size, 1]
+        ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
+            X, self.linear_weight, self.linear_bias
+        )
+        ilr_gated = ACT2FN[self.config.inner_net_gate_activation](ilr_gated)
+
+        if self.config.use_learnable_token_idx:
+            # [B, L, L]
+            token_idx = self.learnable_token_idx[
+                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size,
+                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size,
+            ] + self.token_idx[:, None]
+            ilr_gated = ilr_gated.permute(0, 1, 2, 4, 3)
+        else:
+            # [B, L]
+            token_idx = self.token_idx[
+                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size
+            ]
+
+        coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
+
+        return coeff
 
     def get_inner_loop_inputs(
         self,
@@ -236,16 +393,17 @@ class TttBaseModule(nn.Module):
         XB = self._split_chunks(XB, inner_chunk_size)
         XA = self._split_chunks(XA, inner_chunk_size)
 
-        # [B, num_heads, n_chunk, inner_chunk_size, 1]
-        ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
-            X, self.linear_weight, self.linear_bias
-        )
-        ilr_gated = F.sigmoid(ilr_gated)
+        # # [B, num_heads, n_chunk, inner_chunk_size, 1]
+        # ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
+        #     X, self.linear_weight, self.linear_bias
+        # )
+        # ilr_gated = F.sigmoid(ilr_gated)
 
-        # [B, L]
-        token_idx = self.token_idx[inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size]
+        # # [B, L]
+        # token_idx = self.token_idx[inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size]
 
-        coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, -1, 1) * ilr_gated / self.head_dim
+        # coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, -1, 1) * ilr_gated / self.head_dim
+        coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
 
         return XC, XB, XA, coeff
 
@@ -359,7 +517,7 @@ def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
     )
 
     return z
-    
+
 
 class TttM1Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -417,8 +575,11 @@ class TttM1Module(TttBaseModule):
                         reconstruction_target = XA_chunk
 
                     if self.config.use_vjp:
+                        # DLN_out, LN_vjp = torch.func.vjp(
+                        #     lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
+                        # )
                         DLN_out, LN_vjp = torch.func.vjp(
-                            lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
+                            lambda z: self.decoder_ln_fn(z, ln_weight, ln_bias, 1e-6), Z1
                         )
                         grad_l_wrt_DLN_out = DLN_out - reconstruction_target  # [K,f]
                         grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
@@ -451,12 +612,16 @@ class TttM1Module(TttBaseModule):
                         }
                     else:
 
+                        last_coeff_chunk = coeff_chunk[-1][:, None]
                         Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(1, 0))
-                        b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=0)  # [K,f]
+                        # b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=0)  # [K,f]
+                        b1_bar = b1_init - (coeff_chunk * torch.tril(torch.ones_like(Attn1))) @ grad_l_wrt_Z1  # [K,f]
                         Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar
 
-                        W1_last = W1_init - (coeff_chunk[-1] * X1).transpose(1, 0) @ grad_l_wrt_Z1
-                        b1_last = b1_bar[-1:]
+                        # W1_last = W1_init - (coeff_chunk[-1] * X1).transpose(1, 0) @ grad_l_wrt_Z1
+                        # b1_last = b1_bar[-1:]
+                        W1_last = W1_init - (last_coeff_chunk * X1).transpose(1, 0) @ grad_l_wrt_Z1
+                        b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=0, keepdim=True)
 
                         last_param_dic = {
                             "W1_states": W1_last,
@@ -506,12 +671,15 @@ class TttDecoderLayer(nn.Module):
     def __init__(self, config: TttConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.conv_before_ttt = config.conv_before_ttt
 
-        # TODO(jiarui): rename `self_attn` to ttt related?
-        # self.self_attn = TttModule(config=config, layer_idx=layer_idx)
+        # TODO: rename self_attn to ttt
         self.self_attn = TttM1Module(config=config, layer_idx=layer_idx)
 
         self.mlp = TttMLP(config)
+        if self.conv_before_ttt:
+            self.conv = TttConv(config, layer_idx)
+
         self.input_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = TttRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
@@ -523,6 +691,11 @@ class TttDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[TttCache] = None,
     ):
+        if self.conv_before_ttt:
+            residual = hidden_states
+            hidden_states = self.conv(hidden_states, cache_params=cache_params)
+            hidden_states = residual + hidden_states
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
