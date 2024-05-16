@@ -637,115 +637,11 @@ class TttBaseModule(nn.Module):
 
         return coeff
 
-    def get_inner_loop_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.LongTensor,
-        cache_params: Optional[TttCache] = None,
-        inner_chunk_size: Optional[int] = None,
-    ):
-        batch = hidden_states
-        B, L, C = batch.shape
-        if inner_chunk_size is None:
-            inner_chunk_size = self.inner_chunk_size
-
-        if cache_params is not None:
-            inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
-            # print('inner_chunk_step_offset', inner_chunk_step_offset)
-        else:
-            inner_chunk_step_offset = 0
-
-        n_chunk = L // inner_chunk_size
-        # [B ,n_chunk, inner_chunk_size, C]
-        X = batch.reshape(B, n_chunk, inner_chunk_size, self.width)
-
-        # XC, XB, XA = self.q_proj(batch), self.k_proj(batch), self.v_proj(batch)
-        XC, XB, XA = self.get_qkv_projections(batch, cache_params=cache_params)
-
-        # [B, L, C] -> [B, L, num_heads, head_dim] -> [B, num_heads, L, head_dim]
-        XC = XC.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        XB = XB.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        XA = XA.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        # XC = self._split_heads(XC)
-        # XB = self._split_heads(XB)
-        # XA = self._split_heads(XA)
-
-        cos, sin = self.rotary_emb(XA, position_ids % self.inner_chunk_size)
-
-        # permute_qk and undo_permute_qk is just for aligning pytorch with jax pre-training
-        XC, XB = permute_qk(XC, XB)
-        XC, XB = apply_rotary_pos_emb(XC, XB, cos, sin)
-        XC, XB = undo_permute_qk(XC, XB)
-
-        # XC = self._split_chunks(XC, inner_chunk_size)
-        # XB = self._split_chunks(XB, inner_chunk_size)
-        # XA = self._split_chunks(XA, inner_chunk_size)  # [B,nh,n_chunk, K,f]
-        XC = XC.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
-        XB = XB.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
-        XA = XA.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
-
-        # # [B, num_heads, n_chunk, inner_chunk_size, 1]
-        # ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
-        #     X, self.linear_weight, self.linear_bias
-        # )
-        # ilr_gated = F.sigmoid(ilr_gated)
-
-        # # [B, L]
-        # token_idx = self.token_idx[inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size]
-
-        # coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, -1, 1) * ilr_gated / self.head_dim
-        coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
-
-        return XC, XB, XA, coeff
-
     def gate_with_mixer(self, hidden_states, ttt_output):
         y = self.g_proj(hidden_states)
         y = F.gelu(y, approximate='tanh')
         output = y * ttt_output
         return output
-
-    def forward_chunk(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[TttCache] = None,
-        inner_chunk_size: Optional[int] = None,
-        last_chunk_params_dic: Optional[Dict[str, torch.Tensor]] = None,
-        return_params: Optional[bool] = False,
-    ):
-        XC, XB, XA, coeff = self.get_inner_loop_inputs(
-            hidden_states, position_ids=position_ids, cache_params=cache_params, inner_chunk_size=inner_chunk_size
-        )
-        # print('XB', XB.shape, XB.sum())
-        # print('XA', XA.shape, XA.sum())
-        # print('coeff', coeff.shape, coeff.sum())
-
-        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
-        XCW_batch, batch_params_dic = self.process_inner_loop(
-            inputs,
-            inner_chunk_size=inner_chunk_size,
-            last_chunk_params_dic=last_chunk_params_dic,
-            cache_params=cache_params,
-        )
-        if self.use_mixer:
-            XCW_batch = self.gate_with_mixer(hidden_states, XCW_batch)
-        z_batch = self.project_inner_loop_outputs(XCW_batch)
-
-        if return_params:
-            return z_batch, batch_params_dic
-        else:
-            return z_batch
-
-    def project_inner_loop_outputs(self, XCW_batch):
-        """
-        Inputs
-            XCW_batch: [B,N,F]
-        Outputs
-            z_batch: [B,N,F]
-        """
-        z_batch = self.o_proj(XCW_batch)
-        return z_batch
 
     def prepare_inner_loop_chunk_inputs(self, inputs, inner_chunk_size, cache_params):
         XC = inputs['XC']
@@ -831,43 +727,6 @@ class TttBaseModule(nn.Module):
         z_batch = self.o_proj(XCW_batch)
 
         return z_batch
-
-    def forward_naive(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[TttCache] = None,
-    ):
-        L = hidden_states.shape[1]
-        reminder_len = L % self.inner_chunk_size
-        num_chunks = L // self.inner_chunk_size
-        output_hidden_states = []
-        last_chunk_params_dic = None
-        if num_chunks > 0:
-            chunk_hidden_states, last_chunk_params_dic = self.forward_chunk(
-                hidden_states[:, : num_chunks * self.inner_chunk_size],
-                position_ids=position_ids[:, : num_chunks * self.inner_chunk_size]
-                if position_ids is not None
-                else None,
-                cache_params=cache_params,
-                return_params=True,
-            )
-            output_hidden_states.append(chunk_hidden_states)
-        if reminder_len > 0:
-            output_hidden_states.append(
-                self.forward_chunk(
-                    hidden_states[:, -reminder_len:],
-                    position_ids=position_ids[:, -reminder_len:] if position_ids is not None else None,
-                    cache_params=cache_params,
-                    inner_chunk_size=reminder_len,
-                    last_chunk_params_dic=last_chunk_params_dic,
-                )
-            )
-
-        output_hidden_states = torch.cat(output_hidden_states, dim=1)
-
-        return output_hidden_states
 
 
 def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
