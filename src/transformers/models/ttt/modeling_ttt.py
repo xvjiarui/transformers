@@ -48,23 +48,37 @@ def diff_gelu(x):
     return ff
 
 class TttCache:
-    def __init__(self, config, batch_size, dtype=torch.float32, device=None):
+    def __init__(self, model, batch_size):
+        config = model.config
         self.seqlen_offset = 0
-        self.dtype = dtype
         self.inner_chunk_size = config.inner_net_chunk_size
 
         self.params_dic = defaultdict(dict)
         if 'm1' in config.inner_net_type:
-            self.param_names = ["W1", "b1"]
+            self.inner_param_names = ["W1", "b1"]
         elif 'm2' in config.inner_net_type:
-            self.param_names = ["W1", "b1", "W2", "b2"]
+            self.inner_param_names = ["W1", "b1", "W2", "b2"]
         else:
             raise ValueError(f"inner_net_type {config.inner_net_type} not supported yet")
+        
+        self.conv_states_dic = defaultdict(dict)
+        logger.info(f"Creating cache of size: {batch_size}")
+        for layer_idx in range(config.num_hidden_layers):
+            for name in self.inner_param_names:
+                weight = getattr(model.layers[layer_idx].self_attn, name)
+                tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(model.device)
+                self.params_dic[f"{name}_states"][layer_idx] = tiled_weight
+                self.params_dic[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
+            if config.conv_before_ttt:
+                self.conv_states_dic["conv_before_ttt"][layer_idx] = torch.zeros(batch_size, config.hidden_size, config.conv_kernel, device=model.device)
+            if config.use_mixer and config.share_qk:
+                self.conv_states_dic["ttt_conv_q"][layer_idx] = torch.zeros(batch_size, config.hidden_size, config.conv_kernel, device=model.device)
+                self.conv_states_dic["ttt_conv_k"][layer_idx] = torch.zeros(batch_size, config.hidden_size, config.conv_kernel, device=model.device)
 
     def update(self, py_tree, layer_idx, seq_len):
         # print('update', seq_len, self.inner_chunk_size, self.seqlen_offset)
         if seq_len % self.inner_chunk_size == 0:
-            for name in self.param_names:
+            for name in self.inner_param_names:
                 self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                 self.params_dic[f"{name}_grad"][layer_idx].zero_()
             # print('update seq_len % self.inner_chunk_size == 0')
@@ -72,19 +86,18 @@ class TttCache:
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.inner_chunk_size != 0:
                 raise ValueError("fractional update not supported yet.")
             if (seq_len + self.seqlen_offset) % self.inner_chunk_size == 0:
-                for name in self.param_names:
+                for name in self.inner_param_names:
                     self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                     self.params_dic[f"{name}_grad"][layer_idx].zero_()
                 # print('update seq_len + self.self.seqlen_offset % self.inner_chunk_size == 0')
             else:
-                for name in self.param_names:
+                for name in self.inner_param_names:
                     self.params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
     # for vmap
     def to_dic(self, layer_idx):
         return {name: self.params_dic[name][layer_idx] for name in self.params_dic}
-
 
 class TttRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -235,8 +248,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-
-
 class TttMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -286,23 +297,39 @@ class TttConv(nn.Module):
             padding=config.conv_kernel - 1,
         )
 
-    def __call__(self, x, cache_params=None):
-        seq_len = x.shape[1]
-        x = self.norm(x)
+    def __call__(self, hidden_states, cache_params=None):
+        seq_len = hidden_states.shape[1]
+        hidden_states = self.norm(hidden_states)
 
         # [B, C, L]
-        x = x.transpose(1, 2)
+        hidden_states = hidden_states.transpose(1, 2)
 
-        assert cache_params is None
-        x = self.conv(x)[..., :seq_len]
+        if cache_params is not None:
+            if cache_params.seqlen_offset > 0:
+                conv_state = cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx]
+                conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
+                conv_state[:, :, -1] = hidden_states[:, :, 0]
+                cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
+                hidden_states = torch.sum(conv_state * self.conv.weight[:, 0, :], dim=-1)
+                hidden_states += self.conv.bias
+                hidden_states = hidden_states.unsqueeze(-1)
+            else:
+                conv_state = nn.functional.pad(
+                    hidden_states,
+                    (self.config.conv_kernel - hidden_states.shape[-1], 0)
+                )
+                cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
+                hidden_states = self.conv(hidden_states)[..., :seq_len]
+        else:
+            hidden_states = self.conv(hidden_states)[..., :seq_len]
         # if causal_conv1d_fn is None:
         #     x = self.conv(x)[..., :seq_len]
         # else:
         #     conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
         #     x = causal_conv1d_fn(x, conv_weights, self.conv.bias, activation=None)
-        x = x.transpose(1, 2)
+        hidden_states = hidden_states.transpose(1, 2)
 
-        return x
+        return hidden_states
 
 
 # Function to unpack tensors along the first dimension
@@ -333,7 +360,6 @@ def scan(f, init, xs, length=None):
         carry, y = f(carry, x)
         ys.append(y)
     return carry, torch.stack(ys)
-
 
 
 class LayerNormFunction(torch.autograd.Function):
@@ -464,7 +490,7 @@ class TttBaseModule(nn.Module):
         self.use_mixer = config.use_mixer
         if self.use_mixer:
             self.g_proj = nn.Linear(self.width, self.width, bias=False)
-        
+
         self.inner_net_on_residual = config.inner_net_on_residual
         self.use_post_ln = config.use_post_ln
         self.use_vjp = config.use_vjp
@@ -475,7 +501,7 @@ class TttBaseModule(nn.Module):
             self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        
+
         if self.share_qk:
             self.conv_q = nn.Conv1d(
                 self.hidden_size,
@@ -522,13 +548,46 @@ class TttBaseModule(nn.Module):
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
-    def get_qkv_projections(self, hidden_states):
+    def get_qkv_projections(self, hidden_states, cache_params: Optional[TttCache] = None):
         if self.share_qk:
             xq, XA = self.q_proj(hidden_states), self.v_proj(hidden_states)
             seq_len = xq.shape[1]
             xq = xq.transpose(1, 2)
-            XC = self.conv_q(xq)[..., :seq_len].transpose(1, 2)
-            XB = self.conv_k(xq)[..., :seq_len].transpose(1, 2)
+            if cache_params is not None:
+                if cache_params.seqlen_offset > 0:
+                    conv_q_state = cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx]
+                    conv_q_state = torch.roll(conv_q_state, shifts=-1, dims=-1)
+                    conv_q_state[:, :, -1] = xq[:, :, 0]
+                    cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
+                    XC = torch.sum(conv_q_state * self.conv_q.weight[:, 0, :], dim=-1)
+                    XC += self.conv_q.bias
+                    XC = XC.unsqueeze(-1)
+
+                    conv_k_state = cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx]
+                    conv_k_state = torch.roll(conv_k_state, shifts=-1, dims=-1)
+                    conv_k_state[:, :, -1] = xq[:, :, 0]
+                    cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
+                    XB = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
+                    XB += self.conv_k.bias
+                    XB = XB.unsqueeze(-1)
+                else:
+                    conv_q_state = nn.functional.pad(
+                        xq,
+                        (self.config.conv_kernel - xq.shape[-1], 0)
+                    )
+                    cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
+                    XC = self.conv_q(xq)[..., :seq_len]
+                    conv_k_state = nn.functional.pad(
+                        xq,
+                        (self.config.conv_kernel - xq.shape[-1], 0)
+                    )
+                    cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
+                    XB = self.conv_k(xq)[..., :seq_len]
+            else:
+                XC = self.conv_q(xq)[..., :seq_len]
+                XB = self.conv_k(xq)[..., :seq_len]
+            XC = XC.transpose(1, 2)
+            XB = XB.transpose(1, 2)
         else:
             XC, XB, XA = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
         return XC, XB, XA
@@ -577,7 +636,7 @@ class TttBaseModule(nn.Module):
         coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
 
         return coeff
-    
+
     def get_inner_loop_inputs(
         self,
         hidden_states: torch.Tensor,
@@ -601,7 +660,7 @@ class TttBaseModule(nn.Module):
         X = batch.reshape(B, n_chunk, inner_chunk_size, self.width)
 
         # XC, XB, XA = self.q_proj(batch), self.k_proj(batch), self.v_proj(batch)
-        XC, XB, XA = self.get_qkv_projections(batch)
+        XC, XB, XA = self.get_qkv_projections(batch, cache_params=cache_params)
 
         # [B, L, C] -> [B, L, num_heads, head_dim] -> [B, num_heads, L, head_dim]
         XC = XC.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -617,7 +676,6 @@ class TttBaseModule(nn.Module):
         XC, XB = permute_qk(XC, XB)
         XC, XB = apply_rotary_pos_emb(XC, XB, cos, sin)
         XC, XB = undo_permute_qk(XC, XB)
-
 
         # XC = self._split_chunks(XC, inner_chunk_size)
         # XB = self._split_chunks(XB, inner_chunk_size)
@@ -689,17 +747,92 @@ class TttBaseModule(nn.Module):
         z_batch = self.o_proj(XCW_batch)
         return z_batch
 
-    def process_inner_loop(self, XC, XB, XA, coeff, inner_chunk_size, last_chunk_params_dic, cache_params=None):
-        """
-        Inputs:
-            XA, XB, XC: [B, n_chunk, chunk_size, F] or [B, n_chunk // 4, 4 * chunk_size, F]
-            coeff: [B, n_chunk, chunk_size, 1] or [B,nh, n_chunk / 4, 4 * K, 1]
-        Outputs:
-            [B,N,F]
-        """
-        raise NotImplementedError
+    def prepare_inner_loop_chunk_inputs(self, inputs, inner_chunk_size, cache_params):
+        XC = inputs['XC']
+        XB = inputs['XB']
+        XA = inputs['XA']
+        X = inputs['X']
+        B, L, C = X.shape
+        n_chunk = L // inner_chunk_size
+        # [B ,n_chunk, inner_chunk_size, C]
+        X = X.reshape(B, n_chunk, inner_chunk_size, self.width)
+
+        XC = XC.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+        XB = XB.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+        XA = XA.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+
+        if cache_params is not None:
+            inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
+        else:
+            inner_chunk_step_offset = 0
+        coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
+        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
+        return inputs
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_params: Optional[TttCache] = None,
+    ):
+        B, L = hidden_states.shape[:2]
+        reminder_len = L % self.inner_chunk_size
+        num_chunks = L // self.inner_chunk_size
+        last_chunk_params_dic = None
+
+        XC, XB, XA = self.get_qkv_projections(hidden_states, cache_params=cache_params)
+
+        # [B, L, C] -> [B, L, num_heads, head_dim] -> [B, num_heads, L, head_dim]
+        XC = XC.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        XB = XB.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        XA = XA.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(XA, position_ids % self.inner_chunk_size)
+
+        # permute_qk and undo_permute_qk is just for aligning pytorch with jax pre-training
+        XC, XB = permute_qk(XC, XB)
+        XC, XB = apply_rotary_pos_emb(XC, XB, cos, sin)
+        XC, XB = undo_permute_qk(XC, XB)
+
+        output_XCW_batch = []
+        if num_chunks > 0:
+            inputs = {
+                "XC": XC[:, :, : num_chunks * self.inner_chunk_size],
+                "XB": XB[:, :, : num_chunks * self.inner_chunk_size],
+                "XA": XA[:, :, : num_chunks * self.inner_chunk_size],
+                "X": hidden_states[:, : num_chunks * self.inner_chunk_size],
+            }
+            XCW_batch_chunk, last_chunk_params_dic = self.process_inner_loop(
+                self.prepare_inner_loop_chunk_inputs(inputs, self.inner_chunk_size, cache_params),
+                inner_chunk_size=self.inner_chunk_size,
+                last_chunk_params_dic=last_chunk_params_dic,
+                cache_params=cache_params,
+            )
+            output_XCW_batch.append(XCW_batch_chunk)
+        if reminder_len > 0:
+            inputs = {
+                "XC": XC[:, :, -reminder_len:],
+                "XB": XB[:, :, -reminder_len:],
+                "XA": XA[:, :, -reminder_len:],
+                "X": hidden_states[:, -reminder_len:],
+            }
+            XCW_batch_chunk, last_chunk_params_dic = self.process_inner_loop(
+                self.prepare_inner_loop_chunk_inputs(inputs, reminder_len, cache_params),
+                inner_chunk_size=reminder_len,
+                last_chunk_params_dic=last_chunk_params_dic,
+                cache_params=cache_params,
+            )
+            output_XCW_batch.append(XCW_batch_chunk)
+
+        XCW_batch = torch.cat(output_XCW_batch, dim=1)
+        if self.use_mixer:
+            XCW_batch = self.gate_with_mixer(hidden_states, XCW_batch)
+        z_batch = self.o_proj(XCW_batch)
+
+        return z_batch
+
+    def forward_naive(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -768,7 +901,7 @@ class TttM1Module(TttBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params):
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params: Optional[TttCache]=None):
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
@@ -971,7 +1104,7 @@ class TttM1BMMModule(TttBaseModule):
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params: Optional[TttCache]=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
@@ -1131,7 +1264,7 @@ class TttM2BMMModule(TttBaseModule):
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params=None):
+    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params: Optional[TttCache]=None):
         # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
@@ -1568,7 +1701,7 @@ class TttModel(TttPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_params is None and use_cache:
-            cache_params = self.create_cache(inputs_embeds.size(0), inputs_embeds.device, inputs_embeds.dtype)
+            cache_params = TttCache(self, inputs_embeds.size(0))
 
         seqlen_offset = 0
         if cache_params is not None:
@@ -1624,19 +1757,6 @@ class TttModel(TttPreTrainedModel):
             cache_params=cache_params if use_cache else None,
             hidden_states=all_hidden_states,
         )
-
-    def create_cache(self, batch_size, device, dtype) -> TttCache:
-        logger.info(f"Creating cache of size: {batch_size}")
-        # print("create_cache")
-        cache = TttCache(self.config, batch_size, dtype=dtype, device=device)
-        for layer_idx in range(self.config.num_hidden_layers):
-            for name in cache.param_names:
-                weight = getattr(self.layers[layer_idx].self_attn, name)
-                tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim())
-                cache.params_dic[f"{name}_states"][layer_idx] = tiled_weight
-                cache.params_dic[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
-
-        return cache
 
 
 class TttForCausalLM(TttPreTrainedModel):
