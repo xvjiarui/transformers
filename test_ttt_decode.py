@@ -21,7 +21,8 @@ TTT_STANDARD_CONFIGS = {
     },
 }
 
-model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/04_11_D_300B_ctx_2048_BS_512_M1_Dual_lr_1e-3_ilr_1.0/hf_307200"
+# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/04_11_D_300B_ctx_2048_BS_512_M1_Dual_lr_1e-3_ilr_1.0/hf_307200"
+model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_02_Tok_llama2_D_2.5B_ctx_2048_BS_256_M2_Dual_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
 
 if __name__ == '__main__':
     # config = TttConfig.from_dict(TTT_STANDARD_CONFIGS['debug'])
@@ -46,10 +47,14 @@ if __name__ == '__main__':
     # prompt = ["Hey, are you conscious? Can you talk to me?", "I am Jerry."]
     prompt = "Hey, are you conscious? Can you talk to me?"
     inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=30, truncation=True).to('cuda')
+    # inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=12, truncation=True).to('cuda')
+    # inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=16, truncation=True).to('cuda')
     print('inputs:', inputs.input_ids.shape)
     generation_config=GenerationConfig(pad_token_id=0)
 
-    test_length = 500
+    test_length = 100
+    # test_length = 18
+    # test_length = 40
     # Generate using cache
     start_time = time.time()
     cache_generate_ids = model.generate(**inputs, max_length=test_length, min_length=test_length, do_sample=False, use_cache=True, generation_config=generation_config)
@@ -66,3 +71,4 @@ if __name__ == '__main__':
     print('cache_generate_ids:', cache_generate_ids.shape)
     print(tokenizer.batch_decode(cache_generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0])
     print(cache_generate_ids - no_cache_generate_ids)
+    print(cache_generate_ids[0, inputs.input_ids.shape[1]:] - no_cache_generate_ids[0, inputs.input_ids.shape[1]:])
