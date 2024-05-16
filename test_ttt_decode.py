@@ -47,14 +47,13 @@ if __name__ == '__main__':
     # prompt = ["Hey, are you conscious? Can you talk to me?", "I am Jerry."]
     prompt = "Hey, are you conscious? Can you talk to me?"
     inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=30, truncation=True).to('cuda')
+    test_length = 100
     # inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=12, truncation=True).to('cuda')
+    # test_length = 18
     # inputs = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=16, truncation=True).to('cuda')
     print('inputs:', inputs.input_ids.shape)
     generation_config=GenerationConfig(pad_token_id=0)
 
-    test_length = 100
-    # test_length = 18
-    # test_length = 40
     # Generate using cache
     start_time = time.time()
     cache_generate_ids = model.generate(**inputs, max_length=test_length, min_length=test_length, do_sample=False, use_cache=True, generation_config=generation_config)

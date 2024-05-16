@@ -976,10 +976,13 @@ class TttM1BMMModule(TttBaseModule):
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
-        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+        # in this case, we are decoding
+        if last_chunk_params_dic is None and cache_params is not None:
+            last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
 
-        if cache_params is not None:
+        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
+        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+        if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
@@ -997,45 +1000,58 @@ class TttM1BMMModule(TttBaseModule):
                 else:
                     reconstruction_target = XA_chunk
 
-                # grad_l_wrt_Z1 = Z1 - reconstruction_target
                 ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
                 grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+                if self.coeff_transposed:
+                    # TODO(jiarui): this is buggy, the correct impl needs too keep track all the grad within the same chunk, too nasty to impl, skip for now
+                    logger.warning_once(
+                        "`use_cache=True` with coeff_transposed is not correctly implemented yet, please set `use_cache=False` for matching."
+                    )
+                    coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
-                grad_W1 = X1.transpose(-2, -1) @ grad_l_wrt_Z1 + params_dic["W1_grad"]  # [B,nh,f,f]
-                grad_b1 = grad_l_wrt_Z1.sum(dim=-2, keepdim=True) + params_dic["b1_grad"]  # [B,nh,K=1,f]
+                    # [B, nh, K, f, f]
+                    grad_W1 = torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1)
+                    grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(coeff_chunk), grad_W1) + params_dic["W1_grad"].unsqueeze(2)
+                    # [B, nh, K, f]
+                    grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(coeff_chunk), grad_l_wrt_Z1) + params_dic["b1_grad"]
 
-                last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
-                W1_bar = W1_init - last_coeff_chunk * grad_W1
-                b1_bar = b1_init - last_coeff_chunk * grad_b1  # [B,nh,1,f] - [B,nh,K=1,1] * [B,nh,K=1,f]
+                    W1_bar = W1_init.unsqueeze(2) - grad_W1
+                    b1_bar = b1_init - grad_b1
 
-                Z1_bar = XC_chunk @ W1_bar + b1_bar  # [B,nh,K=1,f]
+                else:
+                    # [B, nh, K, f, f]
+                    grad_W1 = torch.cumsum(torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1), dim=2) + params_dic["W1_grad"].unsqueeze(2)
+                    # [B, nh, K, f]
+                    grad_b1 = torch.cumsum(grad_l_wrt_Z1, dim=2) + params_dic["b1_grad"]  # [B,nh,K=1,f]
 
+                    W1_bar = W1_init.unsqueeze(2) - grad_W1 * coeff_chunk.unsqueeze(-1)
+                    b1_bar = b1_init - grad_b1 * coeff_chunk
+
+                # [B, nh, K, 1, f] @ [B, nh, K, f, f]
+                Z1_bar = (XC_chunk.unsqueeze(3) @ W1_bar).squeeze(3) + b1_bar
+                
                 if self.use_post_ln:
-                    # TODO: accuracy is slightly off, need to investigate later
-                    # Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
-                    # Z1_bar = torch.vmap(self.decoder_ln_fn, in_dims=(1, 0, 0), out_dims=1)(Z1_bar, self.ln_weight, self.ln_bias)
                     Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
+
                 # XCW_chunk = Z1_bar
                 if self.inner_net_on_residual:
                     XCW_chunk = XC_chunk + Z1_bar
                 else:
                     XCW_chunk = Z1_bar
 
+                W1_last = W1_bar[:, :, -1]
+                b1_last = b1_bar[:, :, -1:]
+                grad_W1_last = grad_W1[:, :, -1]
+                grad_b1_last = grad_b1[:, :, -1:]
+
                 last_param_dic = {
-                    "W1_states": W1_bar,
-                    "b1_states": b1_bar,
+                    "W1_states": W1_last,
+                    "b1_states": b1_last,
+                    "W1_grad": grad_W1_last,
+                    "b1_grad": grad_b1_last,
                 }
                 return last_param_dic, XCW_chunk
-
-            init_params_dic = {
-                "W1_states": torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1)),  # [B,nh,f,f]
-                "b1_states": torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1)),
-            }
-            init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
-            init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
-            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
 
         else:
             def compute_chunk(params_dic, inputs):
@@ -1045,7 +1061,8 @@ class TttM1BMMModule(TttBaseModule):
                 XA_chunk = inputs["XA"]  # [B,nh,K,f]
                 XB_chunk = inputs["XB"]
                 XC_chunk = inputs["XC"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K,1]
+                coeff_chunk = inputs["coeff"]  # [B,nh,K,K]
+                coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
                 X1 = XB_chunk
                 Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
@@ -1054,28 +1071,22 @@ class TttM1BMMModule(TttBaseModule):
                 else:
                     reconstruction_target = XA_chunk
 
-                # grad_l_wrt_Z1 = Z1 - reconstruction_target  # [B,nh,K,f]
                 ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
+
                 grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
 
                 Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
-                # b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                b1_bar = b1_init - (coeff_chunk * torch.tril(torch.ones_like(Attn1))) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
+                b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
                 Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                if self.config.use_post_ln:
-                    # TODO: accuracy is slightly off, need to investigate later
-                    # Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
-                    # Z1_bar = torch.vmap(self.decoder_ln_fn, in_dims=(1, 0, 0), out_dims=1)(Z1_bar, self.ln_weight, self.ln_bias)
+
+                if self.use_post_ln:
                     Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
-                # XCW_chunk = Z1_bar  # [B,nh,K,f]
-                if self.config.inner_net_on_residual:
+                if self.inner_net_on_residual:
                     XCW_chunk = XC_chunk + Z1_bar
                 else:
                     XCW_chunk = Z1_bar
 
-                # W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                # b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
                 last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
                 W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
@@ -1083,16 +1094,23 @@ class TttM1BMMModule(TttBaseModule):
                 last_param_dic = {
                     "W1_states": W1_last,
                     "b1_states": b1_last,
+                    "W1_grad": torch.zeros_like(W1_init),
+                    "b1_grad": torch.zeros_like(b1_init),
                 }
                 return last_param_dic, XCW_chunk
 
+        if last_chunk_params_dic is not None:
+            init_params_dic = last_chunk_params_dic
+        else:
             init_params_dic = {
-                "W1_states": torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1)),  # [B,nh,f,f]
+                "W1_states": torch.tile(self.W1.unsqueeze(0), dims=(B, 1, 1, 1)),
                 "b1_states": torch.tile(self.b1.unsqueeze(0), dims=(B, 1, 1, 1)),
             }
-            # inputs = {"XA": XA, "XB": XB, "XC": XC, "coeff": coeff}  # [B,nh,NC,CS,f]
-            inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-            batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+            init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
+            init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
+        inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+
 
         ######################
 
@@ -1152,6 +1170,10 @@ class TttM2BMMModule(TttBaseModule):
                 # [B, nh, K, f]
                 grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
                 if self.coeff_transposed:
+                    # TODO(jiarui): this is buggy, the correct impl needs too keep track all the grad within the same chunk, too nasty to impl, skip for now
+                    logger.warning_once(
+                        "`use_cache=True` with coeff_transposed is not correctly implemented yet, please set `use_cache=False` for matching."
+                    )
                     coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
                     # [B, nh, K, f, f]
