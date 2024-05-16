@@ -21,7 +21,13 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
+from ...utils.import_utils import is_causal_conv1d_available
 from .configuration_ttt import TttConfig
+
+if is_causal_conv1d_available():
+    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+else:
+    causal_conv1d_update, causal_conv1d_fn = None, None
 
 
 class Clamp(nn.Module):
@@ -300,33 +306,52 @@ class TttConv(nn.Module):
     def __call__(self, hidden_states, cache_params=None):
         seq_len = hidden_states.shape[1]
         hidden_states = self.norm(hidden_states)
-
         # [B, C, L]
         hidden_states = hidden_states.transpose(1, 2)
 
-        if cache_params is not None:
-            if cache_params.seqlen_offset > 0:
-                conv_state = cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx]
-                conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
-                conv_state[:, :, -1] = hidden_states[:, :, 0]
-                cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
-                hidden_states = torch.sum(conv_state * self.conv.weight[:, 0, :], dim=-1)
-                hidden_states += self.conv.bias
-                hidden_states = hidden_states.unsqueeze(-1)
+
+        if causal_conv1d_fn is None:
+
+            if cache_params is not None:
+                if cache_params.seqlen_offset > 0:
+                    conv_state = cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx]
+                    conv_state = torch.roll(conv_state, shifts=-1, dims=-1)
+                    conv_state[:, :, -1] = hidden_states[:, :, 0]
+                    cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
+                    hidden_states = torch.sum(conv_state * self.conv.weight[:, 0, :], dim=-1)
+                    hidden_states += self.conv.bias
+                    hidden_states = hidden_states.unsqueeze(-1)
+                else:
+                    conv_state = nn.functional.pad(
+                        hidden_states,
+                        (self.config.conv_kernel - hidden_states.shape[-1], 0)
+                    )
+                    cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
+                    hidden_states = self.conv(hidden_states)[..., :seq_len]
             else:
-                conv_state = nn.functional.pad(
-                    hidden_states,
-                    (self.config.conv_kernel - hidden_states.shape[-1], 0)
-                )
-                cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_state)
                 hidden_states = self.conv(hidden_states)[..., :seq_len]
         else:
-            hidden_states = self.conv(hidden_states)[..., :seq_len]
-        # if causal_conv1d_fn is None:
-        #     x = self.conv(x)[..., :seq_len]
-        # else:
-        #     conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
-        #     x = causal_conv1d_fn(x, conv_weights, self.conv.bias, activation=None)
+            conv_weights = self.conv.weight.view(self.conv.weight.size(0), self.conv.weight.size(2))
+            if cache_params is not None and cache_params.seqlen_offset > 0:
+                hidden_states = causal_conv1d_update(
+                    hidden_states.squeeze(-1),
+                    cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx],
+                    conv_weights,
+                    self.conv.bias,
+                    None,
+                )
+                hidden_states = hidden_states.unsqueeze(-1)
+            else:
+                if cache_params is not None:
+                    conv_states = nn.functional.pad(
+                        hidden_states, (self.config.conv_kernel - hidden_states.shape[-1], 0)
+                    )
+                    cache_params.conv_states_dic['conv_before_ttt'][self.layer_idx].copy_(conv_states)
+                hidden_states = causal_conv1d_fn(
+                    hidden_states, conv_weights, self.conv.bias, activation=None
+                )
+
+        # [B, L, C]
         hidden_states = hidden_states.transpose(1, 2)
 
         return hidden_states
@@ -553,39 +578,78 @@ class TttBaseModule(nn.Module):
             xq, XA = self.q_proj(hidden_states), self.v_proj(hidden_states)
             seq_len = xq.shape[1]
             xq = xq.transpose(1, 2)
-            if cache_params is not None:
-                if cache_params.seqlen_offset > 0:
-                    conv_q_state = cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx]
-                    conv_q_state = torch.roll(conv_q_state, shifts=-1, dims=-1)
-                    conv_q_state[:, :, -1] = xq[:, :, 0]
-                    cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
-                    XC = torch.sum(conv_q_state * self.conv_q.weight[:, 0, :], dim=-1)
-                    XC += self.conv_q.bias
-                    XC = XC.unsqueeze(-1)
+            if causal_conv1d_fn is None:
+                if cache_params is not None:
+                    if cache_params.seqlen_offset > 0:
+                        conv_q_state = cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx]
+                        conv_q_state = torch.roll(conv_q_state, shifts=-1, dims=-1)
+                        conv_q_state[:, :, -1] = xq[:, :, 0]
+                        cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
+                        XC = torch.sum(conv_q_state * self.conv_q.weight[:, 0, :], dim=-1)
+                        XC += self.conv_q.bias
+                        XC = XC.unsqueeze(-1)
 
-                    conv_k_state = cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx]
-                    conv_k_state = torch.roll(conv_k_state, shifts=-1, dims=-1)
-                    conv_k_state[:, :, -1] = xq[:, :, 0]
-                    cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
-                    XB = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
-                    XB += self.conv_k.bias
-                    XB = XB.unsqueeze(-1)
+                        conv_k_state = cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx]
+                        conv_k_state = torch.roll(conv_k_state, shifts=-1, dims=-1)
+                        conv_k_state[:, :, -1] = xq[:, :, 0]
+                        cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
+                        XB = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
+                        XB += self.conv_k.bias
+                        XB = XB.unsqueeze(-1)
+                    else:
+                        conv_q_state = nn.functional.pad(
+                            xq,
+                            (self.config.conv_kernel - xq.shape[-1], 0)
+                        )
+                        cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
+                        XC = self.conv_q(xq)[..., :seq_len]
+                        conv_k_state = nn.functional.pad(
+                            xq,
+                            (self.config.conv_kernel - xq.shape[-1], 0)
+                        )
+                        cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
+                        XB = self.conv_k(xq)[..., :seq_len]
                 else:
-                    conv_q_state = nn.functional.pad(
-                        xq,
-                        (self.config.conv_kernel - xq.shape[-1], 0)
-                    )
-                    cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
                     XC = self.conv_q(xq)[..., :seq_len]
-                    conv_k_state = nn.functional.pad(
-                        xq,
-                        (self.config.conv_kernel - xq.shape[-1], 0)
-                    )
-                    cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
                     XB = self.conv_k(xq)[..., :seq_len]
             else:
-                XC = self.conv_q(xq)[..., :seq_len]
-                XB = self.conv_k(xq)[..., :seq_len]
+                conv_q_weights = self.conv_q.weight.view(self.conv_q.weight.size(0), self.conv_q.weight.size(2))
+                conv_k_weights = self.conv_k.weight.view(self.conv_k.weight.size(0), self.conv_k.weight.size(2))
+                if cache_params is not None and cache_params.seqlen_offset > 0:
+                    XC = causal_conv1d_update(
+                        xq.squeeze(-1),
+                        cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx],
+                        conv_q_weights,
+                        self.conv_q.bias,
+                        None,
+                    )
+                    XC = XC.unsqueeze(-1)
+                    XB = causal_conv1d_update(
+                        xq.squeeze(-1),
+                        cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx],
+                        conv_k_weights,
+                        self.conv_k.bias,
+                        None,
+                    )
+                    XB = XB.unsqueeze(-1)
+                else:
+                    if cache_params is not None:
+                        conv_q_states = nn.functional.pad(
+                            xq, (self.config.conv_kernel - xq.shape[-1], 0)
+                        )
+                        cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_states)
+                        conv_k_states = nn.functional.pad(
+                            xq, (self.config.conv_kernel - xq.shape[-1], 0)
+                        )
+                        cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_states)
+                    XC = causal_conv1d_fn(
+                        xq, conv_q_weights, self.conv_q.bias, activation=None
+                    )
+                    XB = causal_conv1d_fn(
+                        xq, conv_k_weights, self.conv_k.bias, activation=None
+                    )
+
+
             XC = XC.transpose(1, 2)
             XB = XB.transpose(1, 2)
         else:
