@@ -101,7 +101,7 @@ class TttCache:
                     self.params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
-    # for vmap
+
     def to_dic(self, layer_idx):
         return {name: self.params_dic[name][layer_idx] for name in self.params_dic}
 
@@ -478,8 +478,6 @@ class TttBaseModule(nn.Module):
 
         token_idx = 1.0 / torch.arange(1, self.inner_chunk_size + 1)
         self.register_buffer("token_idx", token_idx, persistent=False)
-        if self.config.use_learnable_token_idx:
-            self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size, self.inner_chunk_size)))
 
         # self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         # self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
@@ -500,14 +498,16 @@ class TttBaseModule(nn.Module):
         # ln_bias_data = TttLayerNorm(self.head_dim).bias.data
         self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (self.num_heads, 1)))
 
-        self.gate_ilr_fn = F.linear
+        # self.gate_ilr_fn = F.linear
         # prepending head dim
         linear_weight_data = nn.Linear(self.width, 1, bias=True).weight.data
+        # [num_heads, width, 1]
         self.linear_weight = nn.Parameter(
             torch.stack([torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(self.num_heads)], dim=0)
         )
         linear_bias_data = nn.Linear(self.width, 1, bias=True).bias.data
         # init bias to 0 following original JAX impl.
+        # [num_heads, 1]
         self.linear_bias = nn.Parameter(
             torch.stack([torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)], dim=0)
         )
@@ -673,33 +673,32 @@ class TttBaseModule(nn.Module):
 
     def get_coeff(self, X, inner_chunk_step_offset, inner_chunk_size):
         # [B, num_heads, n_chunk, inner_chunk_size, 1]
-        ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
-            X, self.linear_weight, self.linear_bias
-        )
+        # ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
+        #     X, self.linear_weight, self.linear_bias
+        # )
+        # [B, num_heads, n_chunk, inner_chunk_size, 1]
+        ilr_gated = torch.einsum('bnkc,hdc->bhnkd', X, self.linear_weight) + self.linear_bias.reshape(1, -1, 1, 1, 1)
         ilr_gated = ACT2FN[self.config.inner_net_gate_activation](ilr_gated)
 
-        self.coeff_transposed = False
         # if self.layer_idx == 0:
         #     print('inner_chunk_step_offset', inner_chunk_step_offset, inner_chunk_size)
-        if self.config.use_learnable_token_idx:
-            # [B, L, L]
-            token_idx = self.learnable_token_idx[
-                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size,
-                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size,
-            ] + self.token_idx[:, None]
+        if self.config.transpose_ilr:
+            # [B, num_heads, n_chunk, 1, inner_chunk_size]
             ilr_gated = ilr_gated.permute(0, 1, 2, 4, 3)
-            self.coeff_transposed = True
-        else:
-            # [B, L]
-            token_idx = self.token_idx[
-                inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size
-            ]
-            # ilr_gated = ilr_gated.permute(0, 1, 2, 4, 3)
-            # self.coeff_transposed = True
+        # [B, L]
+        token_idx = self.token_idx[
+            inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size
+        ]
 
-        coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
+        # coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
 
-        return coeff
+        # return coeff
+        # [B, num_heads, n_chunk, inner_chunk_size, 1]
+        token_coeff = torch.broadcast_to(token_idx.reshape(1, 1, 1, inner_chunk_size, 1), (X.shape[0], self.num_heads, X.shape[1], inner_chunk_size, 1))
+        # [B, num_heads, n_chunk, inner_chunk_size, 1] or [B, num_heads, n_chunk, 1, inner_chunk_size] 
+        ilr_coeff = self.config.inner_net_lr * ilr_gated / self.head_dim
+
+        return token_coeff, ilr_coeff
 
     def gate_with_mixer(self, hidden_states, ttt_output):
         y = self.g_proj(hidden_states)
@@ -725,8 +724,10 @@ class TttBaseModule(nn.Module):
             inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
         else:
             inner_chunk_step_offset = 0
-        coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
-        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff}
+        token_coeff, ilr_coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
+        coeff = token_coeff * ilr_coeff
+        # disentangle token_coeff and ilr_coeff for decoding
+        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff, 'token_coeff': token_coeff, 'ilr_coeff': ilr_coeff}
         return inputs
 
     def forward(
@@ -1048,6 +1049,8 @@ class TttM1BMMModule(TttBaseModule):
                 XB_chunk = inputs["XB"]
                 XC_chunk = inputs["XC"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+                token_coeff_chunk = inputs["token_coeff"]
+                ilr_coeff_chunk = inputs["ilr_coeff"]
 
                 X1 = XB_chunk
                 Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
@@ -1059,21 +1062,17 @@ class TttM1BMMModule(TttBaseModule):
                 ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
                 grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
-                if self.coeff_transposed:
-                    # TODO(jiarui): this is buggy, the correct impl needs too keep track all the grad within the same chunk, too nasty to impl, skip for now
-                    logger.warning_once(
-                        "`use_cache=True` with coeff_transposed is not correctly implemented yet, please set `use_cache=False` for matching."
-                    )
-                    coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
+                if self.config.transpose_ilr:
+                    ilr_coeff_chunk = torch.broadcast_to(ilr_coeff_chunk, (*ilr_coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
                     # [B, nh, K, f, f]
                     grad_W1 = torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1)
-                    grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(coeff_chunk), grad_W1) + params_dic["W1_grad"].unsqueeze(2)
+                    grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ilr_coeff_chunk), grad_W1) + params_dic["W1_grad"].unsqueeze(2)
                     # [B, nh, K, f]
-                    grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(coeff_chunk), grad_l_wrt_Z1) + params_dic["b1_grad"]
+                    grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(ilr_coeff_chunk), grad_l_wrt_Z1) + params_dic["b1_grad"]
 
-                    W1_bar = W1_init.unsqueeze(2) - grad_W1
-                    b1_bar = b1_init - grad_b1
+                    W1_bar = W1_init.unsqueeze(2) - grad_W1 * token_coeff_chunk.unsqueeze(-1)
+                    b1_bar = b1_init - grad_b1 * token_coeff_chunk
 
                 else:
                     # [B, nh, K, f, f]
@@ -1210,6 +1209,8 @@ class TttM2BMMModule(TttBaseModule):
                 XB_chunk = inputs["XB"]
                 XC_chunk = inputs["XC"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+                token_coeff_chunk = inputs["token_coeff"]
+                ilr_coeff_chunk = inputs["ilr_coeff"]
 
                 X1 = XB_chunk
                 Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
@@ -1225,29 +1226,25 @@ class TttM2BMMModule(TttBaseModule):
                 grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
                 # [B, nh, K, f]
                 grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
-                if self.coeff_transposed:
-                    # TODO(jiarui): this is buggy, the correct impl needs too keep track all the grad within the same chunk, too nasty to impl, skip for now
-                    logger.warning_once(
-                        "`use_cache=True` with coeff_transposed is not correctly implemented yet, please set `use_cache=False` for matching."
-                    )
-                    coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
+                if self.config.transpose_ilr:
+                    ilr_coeff_chunk = torch.broadcast_to(ilr_coeff_chunk, (*ilr_coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
                     # [B, nh, K, f, f]
                     grad_W2 = torch.einsum("bhki,bhkj->bhkij", X2, grad_l_wrt_Z2)
-                    grad_W2 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(coeff_chunk), grad_W2) + params_dic["W2_grad"].unsqueeze(2)
+                    grad_W2 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ilr_coeff_chunk), grad_W2) + params_dic["W2_grad"].unsqueeze(2)
                     # [B, nh, K, f]
-                    grad_b2 = torch.einsum("bhnk,bhki->bhni", torch.tril(coeff_chunk), grad_l_wrt_Z2) + params_dic["b2_grad"]
+                    grad_b2 = torch.einsum("bhnk,bhki->bhni", torch.tril(ilr_coeff_chunk), grad_l_wrt_Z2) + params_dic["b2_grad"]
 
                     # [B, nh, K, f, f]
                     grad_W1 = torch.einsum("bhki,bhkj->bhkij", X1, grad_l_wrt_Z1)
-                    grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(coeff_chunk), grad_W1) + params_dic["W1_grad"].unsqueeze(2)
+                    grad_W1 = torch.einsum("bhnk,bhkij->bhnij", torch.tril(ilr_coeff_chunk), grad_W1) + params_dic["W1_grad"].unsqueeze(2)
                     # [B, nh, K, f]
-                    grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(coeff_chunk), grad_l_wrt_Z1) + params_dic["b1_grad"]
+                    grad_b1 = torch.einsum("bhnk,bhki->bhni", torch.tril(ilr_coeff_chunk), grad_l_wrt_Z1) + params_dic["b1_grad"]
 
-                    W1_bar = W1_init.unsqueeze(2) - grad_W1
-                    b1_bar = b1_init - grad_b1
-                    W2_bar = W2_init.unsqueeze(2) - grad_W2
-                    b2_bar = b2_init - grad_b2
+                    W1_bar = W1_init.unsqueeze(2) - grad_W1 * token_coeff_chunk.unsqueeze(-1)
+                    b1_bar = b1_init - grad_b1 * token_coeff_chunk
+                    W2_bar = W2_init.unsqueeze(2) - grad_W2 * token_coeff_chunk.unsqueeze(-1)
+                    b2_bar = b2_init - grad_b2 * token_coeff_chunk
 
                 else:
                     # [B, nh, K, f, f]
@@ -1437,13 +1434,11 @@ class TttDecoderLayer(nn.Module):
         self.conv_before_ttt = config.conv_before_ttt
 
         # TODO: rename self_attn to ttt
-        if config.inner_net_type == "m1":
+        if config.inner_net_type == "m1_vmap":
             ttt_module = TttM1Module
-        elif config.inner_net_type == "m1_bmm":
+        elif config.inner_net_type == "m1":
             ttt_module = TttM1BMMModule
         elif config.inner_net_type == "m2":
-            ttt_module = TttM2BMMModule
-        elif config.inner_net_type == "m2_bmm":
             ttt_module = TttM2BMMModule
         else:
             raise ValueError(f"Invalid inner_net_type: {config.inner_net_type}")
