@@ -95,6 +95,94 @@ python benchmark_speed.py --logdir ./exp/decode_ttt_125m \
                             --batch 64 \
                             --promptlen 1 \
                             --genlen 512
+
+# Throughput ~= 5527.135
+python benchmark_speed.py --logdir ./exp/decode_llama_125m \
+                            --mode decode \
+                            --model-name llama-125m \
+                            --batch 64 \
+                            --promptlen 1 \
+                            --genlen 512
+
+# Throughput ~=  1579.703
+python benchmark_speed.py --logdir ./exp/decode_ttt_1b \
+                            --mode decode \
+                            --model-name ttt-1b \
+                            --inner_net m1 \
+                            --batch 64 \
+                            --promptlen 1 \
+                            --genlen 512
+
+# Throughput ~= 2566.247
+python benchmark_speed.py --logdir ./exp/decode_llama_1b \
+                            --mode decode \
+                            --model-name llama-1b \
+                            --batch 64 \
+                            --promptlen 1 \
+                            --genlen 512
+
+
+=== bp ===
+# Throughput ~= 35283.802
+python benchmark_speed.py --logdir ./exp/bp_ttt_125m \
+                            --mode bp \
+                            --model-name ttt-125m \
+                            --inner_net m1 \
+                            --batch 64 \
+                            --promptlen 512 \
+                            --genlen 0
+
+# Throughput ~= 50204.327 (takes 10min to compile)
+python benchmark_speed.py --logdir ./exp/bp_ttt_125m \
+                            --mode bp \
+                            --model-name ttt-125m \
+                            --inner_net m1 \
+                            --batch 64 \
+                            --promptlen 512 \
+                            --genlen 0 \
+                            --use_compile
+
+# Throughput ~= 121013.820
+python benchmark_speed.py --logdir ./exp/bp_llama_125m \
+                            --mode bp \
+                            --model-name llama-125m \
+                            --batch 64 \
+                            --promptlen 512 \
+                            --genlen 0
+
+# Throughput ~= 30236.781
+python benchmark_speed.py --logdir ./exp/bp_ttt_125m \
+                            --mode bp \
+                            --model-name ttt-125m \
+                            --inner_net m1 \
+                            --batch 64 \
+                            --promptlen 1024 \
+                            --genlen 0
+
+# Throughput ~= 121674.856
+python benchmark_speed.py --logdir ./exp/bp_llama_125m \
+                            --mode bp \
+                            --model-name llama-125m \
+                            --batch 64 \
+                            --promptlen 1024 \
+                            --genlen 0
+
+# Throughput ~= 7308.640
+python benchmark_speed.py --logdir ./exp/bp_ttt_1b \
+                            --mode bp \
+                            --model-name ttt-1b \
+                            --inner_net m1 \
+                            --batch 32 \
+                            --promptlen 512 \
+                            --genlen 0
+
+# Throughput ~= 18989.562
+python benchmark_speed.py --logdir ./exp/bp_llama_1b \
+                            --mode bp \
+                            --model-name llama-1b \
+                            --batch 32 \
+                            --promptlen 512 \
+                            --genlen 0
 '''
 
 import argparse
@@ -118,7 +206,7 @@ parser = argparse.ArgumentParser(description="Generation benchmarking")
 parser.add_argument("--logdir", type=str, default="./exp/clean")
 parser.add_argument("--model-name", type=str, default="ttt-1b")
 # state-spaces/mamba-130m | meta-llama/Llama-2-7b | state-spaces/mamba-1.4b | ttt-125m | ttt-1b | ttt-profile
-parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
+parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode", "bp"])
 parser.add_argument("--promptlen", type=int, default=1)
 parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
@@ -156,7 +244,7 @@ logger.info(config_str)
 
 torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 
-repeats = 10
+repeats = 5
 device = "cuda"
 dtype = torch.float16  # @xinhao: follow mamba benchmark
 logger.info("dtype: " + str(dtype))
@@ -201,6 +289,14 @@ elif args.mode == 'prefill':
     def fn(*args):
         model(**kwargs, use_cache=False)
         return
+elif args.mode == 'bp':
+    model.train()
+    kwargs = {'input_ids': input_ids, 'labels': input_ids}
+    def fn(*args):
+        out = model(**kwargs, use_cache=False)
+        loss = out.loss
+        loss.backward()
+        return
 else:
     raise NotImplementedError(f"Invalid Mode {args.mode}!")
 
@@ -208,9 +304,11 @@ out = fn(0)  # capture graph if cg=True, will not be timed
 if args.mode == 'decode':
     logger.info(f"Decode succeeds. output.sequences.shape: {out.sequences.shape}")
     out_len = len(out.sequences[0])
-else:
-    logger.info("Prefill succeeds.")
+elif args.mode in ['prefill', 'bp']:
+    logger.info(f"{args.mode} succeeds.")
     out_len = len(input_ids[0])
+else:
+    raise NotImplementedError(f"Invalid Mode {args.mode}!")
 in_len = len(input_ids[0])
 if args.mode == 'decode':
     print(tokenizer.batch_decode(out.sequences[0].tolist()[:5]))
