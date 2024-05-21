@@ -356,7 +356,6 @@ class TttConv(nn.Module):
 
         return hidden_states
 
-
 # Function to unpack tensors along the first dimension
 def unpack_tensors(tensor_dict):
     # Determine the number of items to unpack (length of first dimension)
@@ -373,7 +372,7 @@ def unpack_tensors(tensor_dict):
     return unpacked_list
 
 
-def scan(f, init, xs, length=None):
+def naive_scan(f, init, xs, length=None):
     """Minic jax.lax.scan function."""
     if xs is None:
         xs = [None] * length
@@ -385,6 +384,24 @@ def scan(f, init, xs, length=None):
         carry, y = f(carry, x)
         ys.append(y)
     return carry, torch.stack(ys)
+
+
+
+def scan(f, init, xs, out):
+    """Minic jax.lax.scan function."""
+    carry = init
+    if isinstance(xs, dict):
+        num_items = len(next(iter(xs.values())))
+    else:
+        num_items = len(xs[0])
+    for i in range(num_items):
+        if isinstance(xs, dict):
+            x = {key: tensor[i] for key, tensor in xs.items()}
+        else:
+            x = [x[i] for x in xs]
+        carry, y = f(carry, x)
+        out[i] = y
+    return carry, out
 
 
 class LayerNormFunction(torch.autograd.Function):
@@ -929,7 +946,6 @@ class TttM1Module(TttBaseModule):
                             "b1_grad": torch.zeros_like(b1_init),
                         }
                     if self.config.use_post_ln:
-                        # TODO: accuracy is slightly off, need to investigate later
                         Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
 
                     if self.config.inner_net_on_residual:
@@ -940,7 +956,7 @@ class TttM1Module(TttBaseModule):
                     return last_param_dic, XCW_chunk
 
                 # [n_chunk, inner_chunk_size, head_dim]
-                output_params_dic, XCW = scan(compute_chunk, init_params_dic, inputs)
+                output_params_dic, XCW = naive_scan(compute_chunk, init_params_dic, inputs)
                 return XCW.reshape(-1, self.head_dim), output_params_dic
 
             # [num_heads, L, C]
@@ -1037,8 +1053,12 @@ class TttM1BMMModule(TttBaseModule):
         if last_chunk_params_dic is None and cache_params is not None:
             last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
+        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
+        num_chunks = inputs['XA'].shape[2]
         L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+        device = inputs['XA'].device
+        dtype = inputs['XA'].dtype
+
         if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
@@ -1164,7 +1184,9 @@ class TttM1BMMModule(TttBaseModule):
             init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
             init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+        # allocate output tensor
+        XCW_batch = torch.empty((num_chunks, B, self.num_heads, inner_chunk_size, self.head_dim), device=device, dtype=dtype)
+        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch)  # [NC,B,nh,CS,f]
 
 
         ######################
@@ -1195,8 +1217,11 @@ class TttM2BMMModule(TttBaseModule):
         if last_chunk_params_dic is None and cache_params is not None:
             last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC/g, g*CS, f]
+        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
+        num_chunks = inputs['XA'].shape[2]
         L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
+        device = inputs['XA'].device
+        dtype = inputs['XA'].dtype
         if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
@@ -1413,7 +1438,9 @@ class TttM2BMMModule(TttBaseModule):
             init_params_dic.update(W2_grad=torch.zeros_like(init_params_dic["W2_states"]))
             init_params_dic.update(b2_grad=torch.zeros_like(init_params_dic["b2_states"]))
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
-        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs)  # [NC,B,nh,CS,f]
+        # allocate output tensor
+        XCW_batch = torch.empty((num_chunks, B, self.num_heads, inner_chunk_size, self.head_dim), device=device, dtype=dtype)
+        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch)  # [NC,B,nh,CS,f]
 
 
         ######################

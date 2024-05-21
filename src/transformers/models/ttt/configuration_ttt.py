@@ -28,13 +28,15 @@ logger = logging.get_logger(__name__)
 
 TTT_STANDARD_CONFIGS = {
     "1b": {
+        "vocab_size": 32000,
         "hidden_size": 2048,
         "intermediate_size": 5504,
-        "num_hidden_layers": 22,
-        "num_attention_heads": 16,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 32,
         "rms_norm_eps": 1e-6,
     },
     "125m": {
+        "vocab_size": 32000,
         "hidden_size": 768,
         "intermediate_size": 2048,
         "num_hidden_layers": 12,
@@ -131,10 +133,10 @@ class TttConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=50277,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
+        vocab_size=32000,
+        hidden_size=2048,
+        intermediate_size=5504,
+        num_hidden_layers=24,
         num_attention_heads=32,
         hidden_act="silu",
         max_position_embeddings=2048,
@@ -145,7 +147,7 @@ class TttConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=0,
         pretraining_tp=1,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
         rope_theta=10000.0,
         rope_scaling=None,
         use_mixer=False,
