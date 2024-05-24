@@ -773,7 +773,7 @@ class TttBaseModule(nn.Module):
         XC, XB = apply_rotary_pos_emb(XC, XB, cos, sin)
         XC, XB = undo_permute_qk(XC, XB)
 
-        output_XCW_batch = []
+        output_hidden_states = torch.empty_like(hidden_states)
         if num_chunks > 0:
             inputs = {
                 "XC": XC[:, :, : num_chunks * self.inner_chunk_size],
@@ -781,13 +781,12 @@ class TttBaseModule(nn.Module):
                 "XA": XA[:, :, : num_chunks * self.inner_chunk_size],
                 "X": hidden_states[:, : num_chunks * self.inner_chunk_size],
             }
-            XCW_batch_chunk, last_chunk_params_dic = self.process_inner_loop(
+            output_hidden_states[:, : num_chunks * self.inner_chunk_size], last_chunk_params_dic = self.process_inner_loop(
                 self.prepare_inner_loop_chunk_inputs(inputs, self.inner_chunk_size, cache_params),
                 inner_chunk_size=self.inner_chunk_size,
                 last_chunk_params_dic=last_chunk_params_dic,
                 cache_params=cache_params,
             )
-            output_XCW_batch.append(XCW_batch_chunk)
         if reminder_len > 0:
             inputs = {
                 "XC": XC[:, :, -reminder_len:],
@@ -795,20 +794,18 @@ class TttBaseModule(nn.Module):
                 "XA": XA[:, :, -reminder_len:],
                 "X": hidden_states[:, -reminder_len:],
             }
-            XCW_batch_chunk, last_chunk_params_dic = self.process_inner_loop(
+            output_hidden_states[:, -reminder_len:], _ = self.process_inner_loop(
                 self.prepare_inner_loop_chunk_inputs(inputs, reminder_len, cache_params),
                 inner_chunk_size=reminder_len,
                 last_chunk_params_dic=last_chunk_params_dic,
                 cache_params=cache_params,
             )
-            output_XCW_batch.append(XCW_batch_chunk)
 
-        XCW_batch = torch.cat(output_XCW_batch, dim=1)
         if self.use_mixer:
-            XCW_batch = self.gate_with_mixer(hidden_states, XCW_batch)
-        z_batch = self.o_proj(XCW_batch)
+            output_hidden_states = self.gate_with_mixer(hidden_states, output_hidden_states)
+        output_hidden_states = self.o_proj(output_hidden_states)
 
-        return z_batch
+        return output_hidden_states
 
 
 def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
