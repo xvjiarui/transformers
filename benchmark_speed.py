@@ -167,6 +167,23 @@ python benchmark_speed.py --logdir ./exp/bp_llama_125m \
                             --promptlen 1024 \
                             --genlen 0
 
+# Throughput ~= 9236.133
+python benchmark_speed.py --logdir ./exp/bp_ttt_125m \
+                            --mode bp \
+                            --model-name ttt-125m \
+                            --inner_net m1 \
+                            --batch 16 \
+                            --promptlen 1024 \
+                            --genlen 0
+
+# Throughput ~= 113062.535
+python benchmark_speed.py --logdir ./exp/bp_llama_125m \
+                            --mode bp \
+                            --model-name llama-125m \
+                            --batch 16 \
+                            --promptlen 1024 \
+                            --genlen 0
+
 # Throughput ~= 7308.640
 python benchmark_speed.py --logdir ./exp/bp_ttt_1b \
                             --mode bp \
@@ -247,6 +264,7 @@ torch.random.manual_seed(0)  # @xinhao: make sure model init is fixed
 repeats = 5
 device = "cuda"
 dtype = torch.float16  # @xinhao: follow mamba benchmark
+torch.set_default_dtype(dtype)
 logger.info("dtype: " + str(dtype))
 
 logger.info(f"Loading model {args.model_name}")
@@ -258,8 +276,7 @@ if args.model_name.startswith("ttt"):
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 elif args.model_name.startswith("llama"):
     llama_size = args.model_name.split('-')[-1]
-    config = LlamaConfig(**TTT_STANDARD_CONFIGS[llama_size])
-    config._attn_implementation = args.attn_impl  # @xinhao: llama config use `_attn_implementation` to select attn
+    config = LlamaConfig(**TTT_STANDARD_CONFIGS[llama_size], attn_implementation=args.attn_impl, torch_dtype=dtype)
     model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
 
 logger.info(model)
