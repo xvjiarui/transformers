@@ -162,6 +162,8 @@ class TttConfig(PretrainedConfig):
         conv_kernel=4,
         inner_net_gate_activation="sigmoid",
         transpose_ilr=False,
+        use_learnable_token_idx=False,
+        use_out_ln=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -192,7 +194,9 @@ class TttConfig(PretrainedConfig):
         self.conv_before_ttt = conv_before_ttt
         self.conv_kernel = conv_kernel
         self.inner_net_gate_activation = inner_net_gate_activation
+        self.use_learnable_token_idx = use_learnable_token_idx
         self.transpose_ilr = transpose_ilr
+        self.use_out_ln = use_out_ln
 
         super().__init__(
             pad_token_id=pad_token_id,

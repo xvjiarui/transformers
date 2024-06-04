@@ -387,7 +387,7 @@ def naive_scan(f, init, xs, length=None):
 
 
 
-def scan(f, init, xs, out):
+def scan(f, init, xs, out, checkpoint_group=1):
     """Minic jax.lax.scan function."""
     carry = init
     if isinstance(xs, dict):
@@ -536,6 +536,15 @@ class TttBaseModule(nn.Module):
         self.inner_net_on_residual = config.inner_net_on_residual
         self.use_post_ln = config.use_post_ln
         self.use_vjp = config.use_vjp
+
+        if config.use_out_ln:
+            self.out_ln = nn.LayerNorm(self.width, eps=1e-6)
+        else:
+            self.out_ln = nn.Identity()
+        
+        self.use_learnable_token_idx = config.use_learnable_token_idx
+        if self.use_learnable_token_idx:
+            self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size,)))
 
     def _init_qkvo_proj(self):
         self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
@@ -703,9 +712,14 @@ class TttBaseModule(nn.Module):
             # [B, num_heads, n_chunk, 1, inner_chunk_size]
             ilr_gated = ilr_gated.permute(0, 1, 2, 4, 3)
         # [B, L]
-        token_idx = self.token_idx[
-            inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size
-        ]
+        if self.use_learnable_token_idx:
+            token_idx = self.token_idx + self.learnable_token_idx
+        else:
+            token_idx = self.token_idx
+        token_idx = token_idx[inner_chunk_step_offset : inner_chunk_step_offset + inner_chunk_size]
+
+        # token idx should be greast than 0
+        token_idx = torch.clamp_min(token_idx, 0.0)
 
         # coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
 
@@ -804,6 +818,7 @@ class TttBaseModule(nn.Module):
             output_hidden_states.append(output_chunk)
 
         output_hidden_states = torch.cat(output_hidden_states, dim=1)
+        output_hidden_states = self.out_ln(output_hidden_states)
         if self.use_mixer:
             output_hidden_states = self.gate_with_mixer(hidden_states, output_hidden_states)
         output_hidden_states = self.o_proj(output_hidden_states)
@@ -1315,13 +1330,13 @@ class TttM2BMMModule(TttBaseModule):
                 grad_W2_last = grad_W2[:, :, -1]
                 grad_b2_last = grad_b2[:, :, -1:]
                 # if self.layer_idx==0:
-                #     # print('decode W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
-                #     # print('decode W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
-                #     # print('decode b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
-                #     # print('decode b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
-                    # print('decode Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
-                    # print('decode W1_init', W1_init.shape, W1_init.sum())
-                    # print('decode W2_init', W2_init.shape, W2_init.sum())
+                #     print('decode W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
+                #     print('decode W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
+                #     print('decode b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
+                #     print('decode b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
+                #     print('decode Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
+                #     # print('decode W1_init', W1_init.shape, W1_init.sum())
+                #     # print('decode W2_init', W2_init.shape, W2_init.sum())
                 #     print('decode Z1', Z1.shape, Z1.sum())
                 #     print('decode Z2', Z2.shape, Z2.sum())
                 #     # print('deocde grad_l_wrt_Z1', grad_l_wrt_Z1.shape, grad_l_wrt_Z1.sum())
@@ -1399,13 +1414,13 @@ class TttM2BMMModule(TttBaseModule):
                 W2_last = W2_init - (last_coeff_chunk * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 b2_last = b2_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
                 # if self.layer_idx==0:
-                #     # print('prefill W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
-                #     # print('prefill W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
-                #     # print('prefill b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
-                #     # print('prefill b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
-                    # print('prefill Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
-                    # print('prefill W1_init', W1_init.shape, W1_init.sum())
-                    # print('prefill W2_init', W2_init.shape, W2_init.sum())
+                #     print('prefill W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
+                #     print('prefill W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
+                #     print('prefill b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
+                #     print('prefill b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
+                #     print('prefill Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
+                #     # print('prefill W1_init', W1_init.shape, W1_init.sum())
+                #     # print('prefill W2_init', W2_init.shape, W2_init.sum())
                 #     print('prefill Z1', Z1.shape, Z1.sum())
                 #     print('prefill Z2', Z2.shape, Z2.sum())
                 #     # print('prefill grad_l_wrt_Z1', grad_l_wrt_Z1.shape, grad_l_wrt_Z1.sum())
