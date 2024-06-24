@@ -155,7 +155,6 @@ class TttConfig(PretrainedConfig):
         inner_net_type='m1',
         inner_net_lr=1.0,
         inner_net_chunk_size=16,
-        use_vjp=True,
         use_post_ln=False,
         inner_net_on_residual=False,
         conv_before_ttt=False,
@@ -164,6 +163,7 @@ class TttConfig(PretrainedConfig):
         transpose_ilr=False,
         use_learnable_token_idx=False,
         use_out_ln=False,
+        scan_checkpoint_group=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -188,7 +188,6 @@ class TttConfig(PretrainedConfig):
         self.inner_net_lr = inner_net_lr
         self.inner_net_chunk_size = inner_net_chunk_size
 
-        self.use_vjp = use_vjp
         self.use_post_ln = use_post_ln
         self.inner_net_on_residual = inner_net_on_residual
         self.conv_before_ttt = conv_before_ttt
@@ -197,6 +196,7 @@ class TttConfig(PretrainedConfig):
         self.use_learnable_token_idx = use_learnable_token_idx
         self.transpose_ilr = transpose_ilr
         self.use_out_ln = use_out_ln
+        self.scan_checkpoint_group = scan_checkpoint_group
 
         super().__init__(
             pad_token_id=pad_token_id,

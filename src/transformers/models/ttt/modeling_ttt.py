@@ -13,7 +13,7 @@ from torch.nn import CrossEntropyLoss
 import einops
 from torch.utils._pytree import tree_map
 
-from ...activations import ACT2FN as _ACT2FN
+from ...activations import ACT2FN
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -29,19 +29,6 @@ if is_causal_conv1d_available():
 else:
     causal_conv1d_update, causal_conv1d_fn = None, None
 
-
-class Clamp(nn.Module):
-    def __init__(self, max_val):
-        super().__init__()
-        self.max_val = max_val
-    def forward(self, x):
-        return x.clamp(min=0, max=self.max_val)
-
-ACT2FN = {
-    "softplus": nn.Softplus(),
-    "softplus_clip_5": nn.Sequential(nn.Softplus(), Clamp(max_val=5)),
-    **_ACT2FN,
-}
 
 logger = logging.get_logger(__name__)
 
@@ -372,108 +359,30 @@ def unpack_tensors(tensor_dict):
     return unpacked_list
 
 
-def naive_scan(f, init, xs, length=None):
-    """Minic jax.lax.scan function."""
-    if xs is None:
-        xs = [None] * length
-    carry = init
-    ys = []
-    if isinstance(xs, dict):
-        xs = unpack_tensors(xs)
-    for x in xs:
-        carry, y = f(carry, x)
-        ys.append(y)
-    return carry, torch.stack(ys)
-
-
-
-def scan(f, init, xs, out, checkpoint_group=1):
+def scan(f, init, xs, out, checkpoint_group=0):
     """Minic jax.lax.scan function."""
     carry = init
     if isinstance(xs, dict):
         num_items = len(next(iter(xs.values())))
     else:
         num_items = len(xs[0])
-    for i in range(num_items):
-        if isinstance(xs, dict):
-            x = {key: tensor[i] for key, tensor in xs.items()}
-        else:
-            x = [x[i] for x in xs]
-        carry, y = f(carry, x)
-        out[i] = y
+    def scan_fn(carry, i_start, i_end):
+        for i in range(i_start, i_end):
+            if isinstance(xs, dict):
+                x = {key: tensor[i] for key, tensor in xs.items()}
+            else:
+                x = [x[i] for x in xs]
+            carry, y = f(carry, x)
+            out[i] = y
+    if checkpoint_group > 0:
+        scan_fn = torch.utils.checkpoint.checkpoint(scan_fn, use_reentrant=False)
+        ckpt_every_n = num_items // checkpoint_group
+        for i in range(0, num_items, ckpt_every_n):
+            scan_fn(carry, i, min(i + ckpt_every_n, num_items))
+    else:
+        scan_fn(carry, 0, num_items)
+
     return carry, out
-
-
-class LayerNormFunction(torch.autograd.Function):
-    generate_vmap_rule = True
-    @staticmethod
-    def forward(input, gamma, beta, eps):
-        N, D = input.shape
-
-        # Mean and variance computation
-        mu = input.mean(dim=-1, keepdim=True)
-        var = input.var(dim=-1, keepdim=True, unbiased=False)
-
-        # Normalization
-        std = torch.sqrt(var + eps)
-        x_hat = (input - mu) / std
-
-        # Scale and shift
-        y = gamma * x_hat + beta
-
-        # Save variables for backward pass
-        # ctx.save_for_backward(x_hat, gamma, std)
-        # ctx.eps = eps
-
-        return y, x_hat, std
-    
-    @staticmethod
-    def setup_context(ctx: Any, inputs: Tuple[Any], output: Any) -> Any:
-        x, gamma, beta, eps = inputs
-        y, x_hat, std = output
-        ctx.save_for_backward(x_hat, gamma, std)
-        ctx.eps = eps
-
-    @staticmethod
-    def backward(ctx, grad_output, grad_x_hat_, grad_std_):
-        x_hat, gamma, std = ctx.saved_tensors
-        N, D = grad_output.shape
-
-        # Gradients for gamma and beta
-        grad_gamma = (grad_output * x_hat).sum(dim=0)
-        grad_beta = grad_output.sum(dim=0)
-
-        # Gradient w.r.t. normalized data
-        grad_x_hat = grad_output * gamma
-
-        # Backpropagation through normalization
-        grad_input = (
-            (1 / D)
-            * (
-                D * grad_x_hat
-                - grad_x_hat.sum(dim=-1, keepdim=True)
-                - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
-            )
-            / std
-        )
-
-        return grad_input, grad_gamma, grad_beta, None
-
-def ttt_layer_norm(input, weight, bias, eps=1e-6):
-    return LayerNormFunction.apply(input, weight, bias, eps)[0]
-
-
-# Usage
-class TttLayerNorm(torch.nn.Module):
-    def __init__(self, features, eps=1e-6):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(features))
-        self.bias = torch.nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, input):
-        return ttt_layer_norm(input, self.weight, self.bias, self.eps)
-
 
 class TttBaseModule(nn.Module):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
@@ -496,38 +405,12 @@ class TttBaseModule(nn.Module):
         token_idx = 1.0 / torch.arange(1, self.inner_chunk_size + 1)
         self.register_buffer("token_idx", token_idx, persistent=False)
 
-        # self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        # self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        # self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
-        # self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.share_qk = config.share_qk
         self.conv_kernel = config.conv_kernel
         self._init_qkvo_proj()
         self._init_rope()
-
-        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
-        # self.decoder_ln_fn = ttt_layer_norm
-        # prepending head dim
-        ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
-        # ln_weight_data = TttLayerNorm(self.head_dim).weight.data
-        self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.unsqueeze(0), (self.num_heads, 1)))
-        ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
-        # ln_bias_data = TttLayerNorm(self.head_dim).bias.data
-        self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (self.num_heads, 1)))
-
-        # self.gate_ilr_fn = F.linear
-        # prepending head dim
-        linear_weight_data = nn.Linear(self.width, 1, bias=True).weight.data
-        # [num_heads, width, 1]
-        self.linear_weight = nn.Parameter(
-            torch.stack([torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(self.num_heads)], dim=0)
-        )
-        linear_bias_data = nn.Linear(self.width, 1, bias=True).bias.data
-        # init bias to 0 following original JAX impl.
-        # [num_heads, 1]
-        self.linear_bias = nn.Parameter(
-            torch.stack([torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)], dim=0)
-        )
+        self._init_gated_ilr()
+        self._init_decoder_ln()
 
         self.use_mixer = config.use_mixer
         if self.use_mixer:
@@ -599,9 +482,32 @@ class TttBaseModule(nn.Module):
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
+    def _init_gated_ilr(self):
+        # prepending head dim
+        linear_weight_data = nn.Linear(self.width, 1, bias=True).weight.data
+        # [num_heads, width, 1]
+        self.linear_weight = nn.Parameter(
+            torch.stack([torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(self.num_heads)], dim=0)
+        )
+        linear_bias_data = nn.Linear(self.width, 1, bias=True).bias.data
+        # init bias to 0 following original JAX impl.
+        # [num_heads, 1]
+        self.linear_bias = nn.Parameter(
+            torch.stack([torch.zeros_like(linear_bias_data) for _ in range(self.num_heads)], dim=0)
+        )
+
+    def _init_decoder_ln(self):
+        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
+        # prepending head dim
+        ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
+        self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.unsqueeze(0), (self.num_heads, 1)))
+        ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
+        self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (self.num_heads, 1)))
+
+
     def get_qkv_projections(self, hidden_states, cache_params: Optional[TttCache] = None):
         if self.share_qk:
-            xq, XA = self.q_proj(hidden_states), self.v_proj(hidden_states)
+            xq, XV = self.q_proj(hidden_states), self.v_proj(hidden_states)
             seq_len = xq.shape[1]
             xq = xq.transpose(1, 2)
             if causal_conv1d_fn is None:
@@ -611,53 +517,53 @@ class TttBaseModule(nn.Module):
                         conv_q_state = torch.roll(conv_q_state, shifts=-1, dims=-1)
                         conv_q_state[:, :, -1] = xq[:, :, 0]
                         cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
-                        XC = torch.sum(conv_q_state * self.conv_q.weight[:, 0, :], dim=-1)
-                        XC += self.conv_q.bias
-                        XC = XC.unsqueeze(-1)
+                        XQ = torch.sum(conv_q_state * self.conv_q.weight[:, 0, :], dim=-1)
+                        XQ += self.conv_q.bias
+                        XQ = XQ.unsqueeze(-1)
 
                         conv_k_state = cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx]
                         conv_k_state = torch.roll(conv_k_state, shifts=-1, dims=-1)
                         conv_k_state[:, :, -1] = xq[:, :, 0]
                         cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
-                        XB = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
-                        XB += self.conv_k.bias
-                        XB = XB.unsqueeze(-1)
+                        XK = torch.sum(conv_k_state * self.conv_k.weight[:, 0, :], dim=-1)
+                        XK += self.conv_k.bias
+                        XK = XK.unsqueeze(-1)
                     else:
                         conv_q_state = nn.functional.pad(
                             xq,
                             (self.config.conv_kernel - xq.shape[-1], 0)
                         )
                         cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx].copy_(conv_q_state)
-                        XC = self.conv_q(xq)[..., :seq_len]
+                        XQ = self.conv_q(xq)[..., :seq_len]
                         conv_k_state = nn.functional.pad(
                             xq,
                             (self.config.conv_kernel - xq.shape[-1], 0)
                         )
                         cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_state)
-                        XB = self.conv_k(xq)[..., :seq_len]
+                        XK = self.conv_k(xq)[..., :seq_len]
                 else:
-                    XC = self.conv_q(xq)[..., :seq_len]
-                    XB = self.conv_k(xq)[..., :seq_len]
+                    XQ = self.conv_q(xq)[..., :seq_len]
+                    XK = self.conv_k(xq)[..., :seq_len]
             else:
                 conv_q_weights = self.conv_q.weight.view(self.conv_q.weight.size(0), self.conv_q.weight.size(2))
                 conv_k_weights = self.conv_k.weight.view(self.conv_k.weight.size(0), self.conv_k.weight.size(2))
                 if cache_params is not None and cache_params.seqlen_offset > 0:
-                    XC = causal_conv1d_update(
+                    XQ = causal_conv1d_update(
                         xq.squeeze(-1),
                         cache_params.conv_states_dic['ttt_conv_q'][self.layer_idx],
                         conv_q_weights,
                         self.conv_q.bias,
                         None,
                     )
-                    XC = XC.unsqueeze(-1)
-                    XB = causal_conv1d_update(
+                    XQ = XQ.unsqueeze(-1)
+                    XK = causal_conv1d_update(
                         xq.squeeze(-1),
                         cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx],
                         conv_k_weights,
                         self.conv_k.bias,
                         None,
                     )
-                    XB = XB.unsqueeze(-1)
+                    XK = XK.unsqueeze(-1)
                 else:
                     if cache_params is not None:
                         conv_q_states = nn.functional.pad(
@@ -668,19 +574,19 @@ class TttBaseModule(nn.Module):
                             xq, (self.config.conv_kernel - xq.shape[-1], 0)
                         )
                         cache_params.conv_states_dic['ttt_conv_k'][self.layer_idx].copy_(conv_k_states)
-                    XC = causal_conv1d_fn(
+                    XQ = causal_conv1d_fn(
                         xq, conv_q_weights, self.conv_q.bias, activation=None
                     )
-                    XB = causal_conv1d_fn(
+                    XK = causal_conv1d_fn(
                         xq, conv_k_weights, self.conv_k.bias, activation=None
                     )
 
 
-            XC = XC.transpose(1, 2)
-            XB = XB.transpose(1, 2)
+            XQ = XQ.transpose(1, 2)
+            XK = XK.transpose(1, 2)
         else:
-            XC, XB, XA = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-        return XC, XB, XA
+            XQ, XK, XV = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        return XQ, XK, XV
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -698,10 +604,6 @@ class TttBaseModule(nn.Module):
         return hidden_states
 
     def get_coeff(self, X, inner_chunk_step_offset, inner_chunk_size):
-        # [B, num_heads, n_chunk, inner_chunk_size, 1]
-        # ilr_gated = torch.vmap(self.gate_ilr_fn, in_dims=(None, 0, 0), out_dims=1)(
-        #     X, self.linear_weight, self.linear_bias
-        # )
         # [B, num_heads, n_chunk, inner_chunk_size, 1]
         ilr_gated = torch.einsum('bnkc,hdc->bhnkd', X, self.linear_weight) + self.linear_bias.reshape(1, -1, 1, 1, 1)
         ilr_gated = ACT2FN[self.config.inner_net_gate_activation](ilr_gated)
@@ -721,8 +623,6 @@ class TttBaseModule(nn.Module):
         # token idx should be greast than 0
         token_idx = torch.clamp_min(token_idx, 0.0)
 
-        # coeff = (self.config.inner_net_lr * token_idx).reshape(1, 1, 1, inner_chunk_size, -1) * ilr_gated / self.head_dim
-
         # return coeff
         # [B, num_heads, n_chunk, inner_chunk_size, 1]
         token_coeff = torch.broadcast_to(token_idx.reshape(1, 1, 1, inner_chunk_size, 1), (X.shape[0], self.num_heads, X.shape[1], inner_chunk_size, 1))
@@ -738,18 +638,18 @@ class TttBaseModule(nn.Module):
         return output
 
     def prepare_inner_loop_chunk_inputs(self, inputs, inner_chunk_size, cache_params):
-        XC = inputs['XC']
-        XB = inputs['XB']
-        XA = inputs['XA']
+        XQ = inputs['XQ']
+        XK = inputs['XK']
+        XV = inputs['XV']
         X = inputs['X']
         B, L, C = X.shape
         n_chunk = L // inner_chunk_size
         # [B ,n_chunk, inner_chunk_size, C]
         X = X.reshape(B, n_chunk, inner_chunk_size, self.width)
 
-        XC = XC.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
-        XB = XB.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
-        XA = XA.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+        XQ = XQ.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+        XK = XK.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
+        XV = XV.reshape(B, self.num_heads, L//inner_chunk_size, inner_chunk_size, self.head_dim)
 
         if cache_params is not None:
             inner_chunk_step_offset = cache_params.seqlen_offset % self.inner_chunk_size
@@ -758,7 +658,7 @@ class TttBaseModule(nn.Module):
         token_coeff, ilr_coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
         coeff = token_coeff * ilr_coeff
         # disentangle token_coeff and ilr_coeff for decoding
-        inputs = {'XC': XC, 'XB': XB, 'XA': XA, 'coeff': coeff, 'token_coeff': token_coeff, 'ilr_coeff': ilr_coeff}
+        inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'coeff': coeff, 'token_coeff': token_coeff, 'ilr_coeff': ilr_coeff}
         return inputs
 
     def forward(
@@ -773,26 +673,26 @@ class TttBaseModule(nn.Module):
         num_chunks = L // self.inner_chunk_size
         last_chunk_params_dic = None
 
-        XC, XB, XA = self.get_qkv_projections(hidden_states, cache_params=cache_params)
+        XQ, XK, XV = self.get_qkv_projections(hidden_states, cache_params=cache_params)
 
         # [B, L, C] -> [B, L, num_heads, head_dim] -> [B, num_heads, L, head_dim]
-        XC = XC.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        XB = XB.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        XA = XA.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        XQ = XQ.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        XK = XK.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        XV = XV.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(XA, position_ids % self.inner_chunk_size)
+        cos, sin = self.rotary_emb(XV, position_ids % self.inner_chunk_size)
 
         # permute_qk and undo_permute_qk is just for aligning pytorch with jax pre-training
-        XC, XB = permute_qk(XC, XB)
-        XC, XB = apply_rotary_pos_emb(XC, XB, cos, sin)
-        XC, XB = undo_permute_qk(XC, XB)
+        XQ, XK = permute_qk(XQ, XK)
+        XQ, XK = apply_rotary_pos_emb(XQ, XK, cos, sin)
+        XQ, XK = undo_permute_qk(XQ, XK)
 
         output_hidden_states = []
         if num_chunks > 0:
             inputs = {
-                "XC": XC[:, :, : num_chunks * self.inner_chunk_size],
-                "XB": XB[:, :, : num_chunks * self.inner_chunk_size],
-                "XA": XA[:, :, : num_chunks * self.inner_chunk_size],
+                "XQ": XQ[:, :, : num_chunks * self.inner_chunk_size],
+                "XK": XK[:, :, : num_chunks * self.inner_chunk_size],
+                "XV": XV[:, :, : num_chunks * self.inner_chunk_size],
                 "X": hidden_states[:, : num_chunks * self.inner_chunk_size],
             }
             output_chunk, last_chunk_params_dic = self.process_inner_loop(
@@ -804,9 +704,9 @@ class TttBaseModule(nn.Module):
             output_hidden_states.append(output_chunk)
         if reminder_len > 0:
             inputs = {
-                "XC": XC[:, :, -reminder_len:],
-                "XB": XB[:, :, -reminder_len:],
-                "XA": XA[:, :, -reminder_len:],
+                "XQ": XQ[:, :, -reminder_len:],
+                "XK": XK[:, :, -reminder_len:],
+                "XV": XV[:, :, -reminder_len:],
                 "X": hidden_states[:, -reminder_len:],
             }
             output_chunk, _ = self.process_inner_loop(
@@ -825,189 +725,6 @@ class TttBaseModule(nn.Module):
 
         return output_hidden_states
 
-
-def decoder_ln_bwd(input, label, gamma, beta, eps=1e-6):
-    D = input.shape[-1]
-    mu = input.mean(dim=1, keepdim=True)
-    var = input.var(dim=1, keepdim=True, unbiased=False)
-
-    std = torch.sqrt(var + eps)
-    x_hat = (input - mu) / std
-    y = gamma * x_hat + beta
-
-    grad_output = y - label
-    grad_x_hat = grad_output * gamma
-    z = (
-        (1.0 / D)
-        * (
-            D * grad_x_hat
-            - grad_x_hat.sum(dim=1, keepdim=True)
-            - x_hat * (grad_x_hat * x_hat).sum(dim=1, keepdim=True)
-        )
-        / std
-    )
-
-    return z
-
-
-class TttM1Module(TttBaseModule):
-    def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
-
-        self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
-        self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
-
-    def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params: Optional[TttCache]=None):
-        if inner_chunk_size is None:
-            inner_chunk_size = self.inner_chunk_size
-
-        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
-        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
-
-        @torch.vmap
-        def update_embed(inputs, last_params_dic=None):
-            if last_params_dic is not None:
-                params_dic = last_params_dic
-            else:
-                params_dic = {
-                    "W1_states": self.W1,
-                    "b1_states": self.b1,
-                }
-                if cache_params is not None:
-                    params_dic.upadte(
-                        {
-                            "W1_grad": torch.zeros_like(self.W1),
-                            "b1_grad": torch.zeros_like(self.b1),
-                        }
-                    )
-
-            @torch.vmap
-            def parallelize_over_heads(inputs, init_params_dic, ln_weight, ln_bias):
-                def compute_chunk(params_dic, inputs):
-                    # W_init_chunk: [C, C]
-                    W1_init = params_dic["W1_states"]
-                    b1_init = params_dic["b1_states"]
-
-                    # [inner_chunk_size, C]
-                    XA_chunk = inputs["XA"]
-                    # [inner_chunk_size, C]
-                    XB_chunk = inputs["XB"]
-                    # [inner_chunk_size, C]
-                    XC_chunk = inputs["XC"]
-                    # [inner_chunk_size, 1]
-                    coeff_chunk = inputs["coeff"]
-
-                    X1 = XB_chunk
-                    Z1 = X1 @ W1_init + b1_init
-
-                    if self.config.inner_net_on_residual:
-                        reconstruction_target = XA_chunk - XB_chunk
-                    else:
-                        reconstruction_target = XA_chunk
-
-                    if self.config.use_vjp:
-                        DLN_out, LN_vjp = torch.func.vjp(
-                            lambda z: self.decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), Z1
-                        )
-                        # DLN_out, LN_vjp = torch.func.vjp(
-                        #     lambda z: self.decoder_ln_fn(z, ln_weight, ln_bias, 1e-6), Z1
-                        # )
-                        grad_l_wrt_DLN_out = DLN_out - reconstruction_target  # [K,f]
-                        grad_l_wrt_Z1 = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
-                    else:
-                        grad_l_wrt_Z1 = decoder_ln_bwd(Z1, reconstruction_target, ln_weight, ln_bias)
-
-                    # NOTE: fractional forward, caching the gradients, and cumsum from cache
-                    if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
-                        # [K, C, C]
-                        grad_W1 = (
-                            torch.cumsum(torch.einsum("bi,bj->bij", XB_chunk, grad_l_wrt_Z1), dim=0)
-                            + params_dic["W1_grad"]
-                        )
-                        # [K, C]
-                        grad_b1 = torch.cumsum(grad_l_wrt_Z1, dim=0) + params_dic["b1_grad"]
-                        b1_bar = b1_init - (coeff_chunk * grad_b1)  # [K, C]
-                        # [K, C]
-                        Z1_bar = (XC_chunk.unsqueeze(1) @ (W1_init - coeff_chunk.unsqueeze(-1) * grad_W1)).squeeze(
-                            1
-                        ) + b1_bar
-
-                        W1_last = W1_init - (coeff_chunk[-1] * grad_W1[-1])
-                        b1_last = b1_bar[-1:]
-
-                        last_param_dic = {
-                            "W1_states": W1_last,
-                            "b1_states": b1_last,
-                            "W1_grad": grad_W1[-1],
-                            "b1_grad": grad_b1[-1:],
-                        }
-                    else:
-
-                        Attn1 = torch.tril(XC_chunk @ XB_chunk.transpose(1, 0))
-                        # b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=0)  # [K,f]
-                        b1_bar = b1_init - (coeff_chunk * torch.tril(torch.ones_like(Attn1))) @ grad_l_wrt_Z1  # [K,f]
-                        Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar
-
-                        # W1_last = W1_init - (coeff_chunk[-1] * X1).transpose(1, 0) @ grad_l_wrt_Z1
-                        # b1_last = b1_bar[-1:]
-                        last_coeff_chunk = coeff_chunk[-1][:, None]
-                        W1_last = W1_init - (last_coeff_chunk * X1).transpose(1, 0) @ grad_l_wrt_Z1
-                        b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=0, keepdim=True)
-
-                        last_param_dic = {
-                            "W1_states": W1_last,
-                            "b1_states": b1_last,
-                            "W1_grad": torch.zeros_like(W1_init),
-                            "b1_grad": torch.zeros_like(b1_init),
-                        }
-                    if self.config.use_post_ln:
-                        Z1_bar = self.decoder_ln_fn(Z1_bar, weight=ln_weight, bias=ln_bias)
-
-                    if self.config.inner_net_on_residual:
-                        XCW_chunk = XC_chunk + Z1_bar
-                    else:
-                        XCW_chunk = Z1_bar
-
-                    return last_param_dic, XCW_chunk
-
-                # [n_chunk, inner_chunk_size, head_dim]
-                output_params_dic, XCW = naive_scan(compute_chunk, init_params_dic, inputs)
-                return XCW.reshape(-1, self.head_dim), output_params_dic
-
-            # [num_heads, L, C]
-            return parallelize_over_heads(inputs, params_dic, self.ln_weight, self.ln_bias)
-
-        # in this case, we are decoding
-        if last_chunk_params_dic is None and cache_params is not None:
-            last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
-
-        if last_chunk_params_dic is not None:
-            XCW_batch, batch_params_dic = update_embed(inputs, last_chunk_params_dic)
-        else:
-            XCW_batch, batch_params_dic = update_embed(inputs)
-
-        # [B, num_heads, L, C]
-        if cache_params is not None:
-            cache_params.update(batch_params_dic, self.layer_idx, L)
-
-        # [B, L, C]
-        XCW_batch = XCW_batch.permute(0, 2, 1, 3).reshape(B, L, -1)
-
-        return XCW_batch, batch_params_dic
-
-def dln_bwd(input, label, ln_weight, ln_bias, use_vjp=True):
-    dim = input.shape[-1]
-    decoder_ln_fn = partial(F.layer_norm, normalized_shape=[dim], eps=1e-6)
-    if use_vjp:
-        DLN_out, LN_vjp = torch.func.vjp(
-            lambda z: decoder_ln_fn(z, weight=ln_weight, bias=ln_bias), input
-        )
-        grad_l_wrt_DLN_out = DLN_out - label  # [K,f]
-        grad_l_wrt_inp = LN_vjp(grad_l_wrt_DLN_out)[0]  # [K,f]
-    else:
-        grad_l_wrt_inp = decoder_ln_bwd(input, label, ln_weight, ln_bias)
-    
-    return grad_l_wrt_inp
 
 def ln_fwd(x, gamma, beta, eps=1e-6):
 
@@ -1068,11 +785,11 @@ class TttM1BMMModule(TttBaseModule):
         if last_chunk_params_dic is None and cache_params is not None:
             last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
-        num_chunks = inputs['XA'].shape[2]
-        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
-        device = inputs['XA'].device
-        dtype = inputs['XA'].dtype
+        B = inputs['XV'].shape[0]  # [B, nh, NC, CS, f]
+        num_chunks = inputs['XV'].shape[2]
+        L = inputs['XV'].shape[2] * inputs['XV'].shape[3]
+        device = inputs['XV'].device
+        dtype = inputs['XV'].dtype
 
         if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
             # @xinhao: decoding
@@ -1080,9 +797,9 @@ class TttM1BMMModule(TttBaseModule):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
                 b1_init = params_dic["b1_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
+                XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
+                XB_chunk = inputs["XK"]
+                XC_chunk = inputs["XQ"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
                 token_coeff_chunk = inputs["token_coeff"]
                 ilr_coeff_chunk = inputs["ilr_coeff"]
@@ -1124,7 +841,6 @@ class TttM1BMMModule(TttBaseModule):
                 if self.use_post_ln:
                     Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
 
-                # XCW_chunk = Z1_bar
                 if self.inner_net_on_residual:
                     XCW_chunk = XC_chunk + Z1_bar
                 else:
@@ -1148,9 +864,9 @@ class TttM1BMMModule(TttBaseModule):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
                 b1_init = params_dic["b1_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
+                XA_chunk = inputs["XV"]  # [B,nh,K,f]
+                XB_chunk = inputs["XK"]
+                XC_chunk = inputs["XQ"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K,K]
                 coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
@@ -1201,10 +917,8 @@ class TttM1BMMModule(TttBaseModule):
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
         # allocate output tensor
         XCW_batch = torch.empty((num_chunks, B, self.num_heads, inner_chunk_size, self.head_dim), device=device, dtype=dtype)
-        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch)  # [NC,B,nh,CS,f]
+        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch, self.config.scan_checkpoint_group if self.training else 0)  # [NC,B,nh,CS,f]
 
-
-        ######################
 
         # [B, num_heads, L, C]
         if cache_params is not None:
@@ -1232,11 +946,11 @@ class TttM2BMMModule(TttBaseModule):
         if last_chunk_params_dic is None and cache_params is not None:
             last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
 
-        B = inputs['XA'].shape[0]  # [B, nh, NC, CS, f]
-        num_chunks = inputs['XA'].shape[2]
-        L = inputs['XA'].shape[2] * inputs['XA'].shape[3]
-        device = inputs['XA'].device
-        dtype = inputs['XA'].dtype
+        B = inputs['XV'].shape[0]  # [B, nh, NC, CS, f]
+        num_chunks = inputs['XV'].shape[2]
+        L = inputs['XV'].shape[2] * inputs['XV'].shape[3]
+        device = inputs['XV'].device
+        dtype = inputs['XV'].dtype
         if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
             # @xinhao: decoding
             def compute_chunk(params_dic, inputs):
@@ -1245,9 +959,9 @@ class TttM2BMMModule(TttBaseModule):
                 W2_init = params_dic["W2_states"]  # [B,nh,f,f]
                 b2_init = params_dic["b2_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K=1,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
+                XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
+                XB_chunk = inputs["XK"]
+                XC_chunk = inputs["XQ"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
                 token_coeff_chunk = inputs["token_coeff"]
                 ilr_coeff_chunk = inputs["ilr_coeff"]
@@ -1310,7 +1024,6 @@ class TttM2BMMModule(TttBaseModule):
                 if self.use_post_ln:
                     Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
 
-                # XCW_chunk = Z2_bar
                 if self.inner_net_on_residual:
                     XCW_chunk = XC_chunk + Z2_bar
                 else:
@@ -1320,28 +1033,10 @@ class TttM2BMMModule(TttBaseModule):
                 b1_last = b1_bar[:, :, -1:]
                 W2_last = W2_bar[:, :, -1]
                 b2_last = b2_bar[:, :, -1:]
-                # last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
-                # W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                # b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
-                # W2_last = W2_init - (last_coeff_chunk * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                # b2_last = b2_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
                 grad_W1_last = grad_W1[:, :, -1]
                 grad_b1_last = grad_b1[:, :, -1:]
                 grad_W2_last = grad_W2[:, :, -1]
                 grad_b2_last = grad_b2[:, :, -1:]
-                # if self.layer_idx==0:
-                #     print('decode W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
-                #     print('decode W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
-                #     print('decode b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
-                #     print('decode b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
-                #     print('decode Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
-                #     # print('decode W1_init', W1_init.shape, W1_init.sum())
-                #     # print('decode W2_init', W2_init.shape, W2_init.sum())
-                #     print('decode Z1', Z1.shape, Z1.sum())
-                #     print('decode Z2', Z2.shape, Z2.sum())
-                #     # print('deocde grad_l_wrt_Z1', grad_l_wrt_Z1.shape, grad_l_wrt_Z1.sum())
-                #     # print('decode grad_l_wrt_Z2', grad_l_wrt_Z2.shape, grad_l_wrt_Z2.sum())
-                #     # print('decode coeff', coeff_chunk.shape, coeff_chunk.sum())
 
                 last_param_dic = {
                     "W1_states": W1_last,
@@ -1362,9 +1057,9 @@ class TttM2BMMModule(TttBaseModule):
                 W2_init = params_dic["W2_states"]  # [B,nh,f,f]
                 b2_init = params_dic["b2_states"]  # [B,nh,1,f]
 
-                XA_chunk = inputs["XA"]  # [B,nh,K,f]
-                XB_chunk = inputs["XB"]
-                XC_chunk = inputs["XC"]
+                XA_chunk = inputs["XV"]  # [B,nh,K,f]
+                XB_chunk = inputs["XK"]
+                XC_chunk = inputs["XQ"]
                 coeff_chunk = inputs["coeff"]  # [B,nh,K,K]
                 coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
@@ -1377,7 +1072,6 @@ class TttM2BMMModule(TttBaseModule):
                 else:
                     reconstruction_target = XA_chunk
 
-                # grad_l_wrt_Z2 = Z2 - XA_chunk  # [B,nh,K,f]
                 ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
 
@@ -1385,47 +1079,25 @@ class TttM2BMMModule(TttBaseModule):
                 grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
 
                 Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
-                # b1_bar = b1_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z1, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                # b1_bar = b1_init - (coeff_chunk * torch.tril(torch.ones_like(Attn1))) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
                 b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
                 Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
                 X2_bar = F.gelu(Z1_bar, approximate='tanh')
 
                 Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
-                # b2_bar = b2_init - coeff_chunk * torch.cumsum(grad_l_wrt_Z2, dim=-2)  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                # b2_bar = b2_init - (coeff_chunk * torch.tril(torch.ones_like(Attn2))) @ grad_l_wrt_Z2  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
                 b2_bar = b2_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z2  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
                 Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
                 if self.use_post_ln:
                     Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
-                # XCW_chunk = Z2_bar  # [B,nh,K,f]
                 if self.inner_net_on_residual:
                     XCW_chunk = XC_chunk + Z2_bar
                 else:
                     XCW_chunk = Z2_bar
 
-                # W1_last = W1_init - (coeff_chunk[:,:,-1:] * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                # b1_last = b1_bar[:,:,-1:]  # [B,nh,1,f]
-                # W2_last = W2_init - (coeff_chunk[:, :, -1:] * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                # b2_last = b2_bar[:, :, -1:]  # [B,nh,1,f]
                 last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
                 W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
                 W2_last = W2_init - (last_coeff_chunk * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
                 b2_last = b2_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
-                # if self.layer_idx==0:
-                #     print('prefill W1_last', self.layer_idx, W1_last.shape, W1_last.sum())
-                #     print('prefill W2_last', self.layer_idx, W2_last.shape, W2_last.sum())
-                #     print('prefill b1_last', self.layer_idx, b1_last.shape, b1_last.sum())
-                #     print('prefill b2_last', self.layer_idx, b2_last.shape, b2_last.sum())
-                #     print('prefill Z2_bar', Z2_bar.shape, Z2_bar[:, :, -1:].sum())
-                #     # print('prefill W1_init', W1_init.shape, W1_init.sum())
-                #     # print('prefill W2_init', W2_init.shape, W2_init.sum())
-                #     print('prefill Z1', Z1.shape, Z1.sum())
-                #     print('prefill Z2', Z2.shape, Z2.sum())
-                #     # print('prefill grad_l_wrt_Z1', grad_l_wrt_Z1.shape, grad_l_wrt_Z1.sum())
-                #     # print('prefill grad_l_wrt_Z2', grad_l_wrt_Z2.shape, grad_l_wrt_Z2.sum())
-                #     # print('prefill coeff', coeff_chunk.shape, coeff_chunk.sum())
 
                 last_param_dic = {
                     "W1_states": W1_last,
@@ -1455,10 +1127,8 @@ class TttM2BMMModule(TttBaseModule):
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
         # allocate output tensor
         XCW_batch = torch.empty((num_chunks, B, self.num_heads, inner_chunk_size, self.head_dim), device=device, dtype=dtype)
-        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch)  # [NC,B,nh,CS,f]
+        batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch, self.config.scan_checkpoint_group if self.training else 0)  # [NC,B,nh,CS,f]
 
-
-        ######################
 
         # [B, num_heads, L, C]
         if cache_params is not None:
@@ -1475,10 +1145,7 @@ class TttDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.conv_before_ttt = config.conv_before_ttt
 
-        # TODO: rename self_attn to ttt
-        if config.inner_net_type == "m1_vmap":
-            ttt_module = TttM1Module
-        elif config.inner_net_type == "m1":
+        if config.inner_net_type == "m1":
             ttt_module = TttM1BMMModule
         elif config.inner_net_type == "m2":
             ttt_module = TttM2BMMModule
