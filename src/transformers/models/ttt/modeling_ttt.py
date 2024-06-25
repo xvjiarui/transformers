@@ -375,10 +375,9 @@ def scan(f, init, xs, out, checkpoint_group=0):
             carry, y = f(carry, x)
             out[i] = y
     if checkpoint_group > 0:
-        scan_fn = torch.utils.checkpoint.checkpoint(scan_fn, use_reentrant=False)
         ckpt_every_n = num_items // checkpoint_group
         for i in range(0, num_items, ckpt_every_n):
-            scan_fn(carry, i, min(i + ckpt_every_n, num_items))
+            torch.utils.checkpoint.checkpoint(scan_fn, carry, i, min(i + ckpt_every_n, num_items), use_reentrant=False)
     else:
         scan_fn(carry, 0, num_items)
 
@@ -418,7 +417,6 @@ class TttBaseModule(nn.Module):
 
         self.inner_net_on_residual = config.inner_net_on_residual
         self.use_post_ln = config.use_post_ln
-        self.use_vjp = config.use_vjp
 
         if config.use_out_ln:
             self.out_ln = nn.LayerNorm(self.width, eps=1e-6)

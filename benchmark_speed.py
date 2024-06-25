@@ -229,6 +229,8 @@ parser.add_argument("--genlen", type=int, default=128)
 parser.add_argument("--batch", type=int, default=1)
 parser.add_argument("--attn_impl", type=str, default='flash_attention_2', choices=['eager', 'flash_attention_2'])
 parser.add_argument("--inner_net", type=str, default='m1', choices=['m1','m2'])
+parser.add_argument("--inner_chunk_size", type=int, default=16)
+parser.add_argument("--scan_checkpoint_group", type=int, default=0)
 parser.add_argument("--use_compile", action='store_true')
 parser.add_argument("--profile", action='store_true')  # @xinhao: pytorch profiler, different from nsys in micro-benchmark
 args = parser.parse_args()
@@ -271,7 +273,7 @@ logger.info(f"Loading model {args.model_name}")
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 if args.model_name.startswith("ttt"):
     ttt_size = args.model_name.split('-')[-1]
-    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size])
+    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS[ttt_size], inner_net_chunk_size=args.inner_chunk_size, scan_checkpoint_group=args.scan_checkpoint_group, torch_dtype=dtype)
     ttt_config.inner_net = args.inner_net
     model = TttForCausalLM(ttt_config).to(device=device, dtype=dtype)
 elif args.model_name.startswith("llama"):
