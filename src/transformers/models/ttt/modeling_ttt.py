@@ -69,12 +69,10 @@ class TttCache:
                 self.conv_states_dic["ttt_conv_k"][layer_idx] = torch.zeros(batch_size, config.hidden_size, config.conv_kernel, device=model.device)
 
     def update(self, py_tree, layer_idx, seq_len):
-        # print('update', seq_len, self.inner_chunk_size, self.seqlen_offset)
         if seq_len % self.inner_chunk_size == 0:
             for name in self.inner_param_names:
                 self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                 self.params_dic[f"{name}_grad"][layer_idx].zero_()
-            # print('update seq_len % self.inner_chunk_size == 0')
         elif seq_len < self.inner_chunk_size:
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.inner_chunk_size != 0:
                 raise ValueError("fractional update not supported yet.")
@@ -82,7 +80,6 @@ class TttCache:
                 for name in self.inner_param_names:
                     self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
                     self.params_dic[f"{name}_grad"][layer_idx].zero_()
-                # print('update seq_len + self.self.seqlen_offset % self.inner_chunk_size == 0')
             else:
                 for name in self.inner_param_names:
                     self.params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
@@ -590,13 +587,10 @@ class TttBaseModule(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
 
     def _split_chunks(self, hidden_states, inner_chunk_size=None):
-        B, N, num_head, head_dim = hidden_states.shape
-        # @xinhao: 2 means two chunks as a group to use gradient checkpointing
-        # T=2048, optimal ckpt num = sqrt(T) ~= 45
-        # Since CS=16, when 4 chunks are grouped, ckpt num = 2048 / 64 = 32, which is closest to 45
+        assert hidden_states.ndim == 4
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
-        hidden_states = hidden_states.reshape(B, -1, inner_chunk_size, self.num_heads, self.head_dim).permute(
+        hidden_states = hidden_states.reshape(hidden_states.shape[0], -1, inner_chunk_size, self.num_heads, self.head_dim).permute(
             0, 3, 1, 2, 4
         )  # [B,nh,n_chunk,K,f]
         return hidden_states
@@ -606,8 +600,6 @@ class TttBaseModule(nn.Module):
         ilr_gated = torch.einsum('bnkc,hdc->bhnkd', X, self.linear_weight) + self.linear_bias.reshape(1, -1, 1, 1, 1)
         ilr_gated = ACT2FN[self.config.inner_net_gate_activation](ilr_gated)
 
-        # if self.layer_idx == 0:
-        #     print('inner_chunk_step_offset', inner_chunk_step_offset, inner_chunk_size)
         if self.config.transpose_ilr:
             # [B, num_heads, n_chunk, 1, inner_chunk_size]
             ilr_gated = ilr_gated.permute(0, 1, 2, 4, 3)
@@ -631,6 +623,7 @@ class TttBaseModule(nn.Module):
 
     def gate_with_mixer(self, hidden_states, ttt_output):
         y = self.g_proj(hidden_states)
+        # use 'tanh' approximation for matching JAX impl.
         y = F.gelu(y, approximate='tanh')
         output = y * ttt_output
         return output
@@ -913,6 +906,7 @@ class TttM1BMMModule(TttBaseModule):
             init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
             init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
         inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+
         # allocate output tensor
         XCW_batch = torch.empty((num_chunks, B, self.num_heads, inner_chunk_size, self.head_dim), device=device, dtype=dtype)
         batch_params_dic, XCW_batch = scan(compute_chunk, init_params_dic, inputs, XCW_batch, self.config.scan_checkpoint_group if self.training else 0)  # [NC,B,nh,CS,f]
@@ -922,7 +916,6 @@ class TttM1BMMModule(TttBaseModule):
         if cache_params is not None:
             cache_params.update(batch_params_dic, self.layer_idx, L)
 
-        # XCW_batch = XCW_batch.permute(1, 2, 0, 3, 4).reshape(B, L, -1)  # [B,L,f]
         XCW_batch = einops.rearrange(XCW_batch, "nc b nh cs f -> b (nc cs) (nh f)")  # [B,L,f]
         return XCW_batch, batch_params_dic
 
@@ -1132,7 +1125,6 @@ class TttM2BMMModule(TttBaseModule):
         if cache_params is not None:
             cache_params.update(batch_params_dic, self.layer_idx, L)
 
-        # XCW_batch = XCW_batch.permute(1, 2, 0, 3, 4).reshape(B, L, -1)  # [B,L,f]
         XCW_batch = einops.rearrange(XCW_batch, "nc b nh cs f -> b (nc cs) (nh f)")  # [B,L,f]
         return XCW_batch, batch_params_dic
 
@@ -1335,8 +1327,6 @@ class TttModel(TttPreTrainedModel):
             seqlen_offset, seqlen_offset+ inputs_embeds.shape[1], dtype=torch.long, device=inputs_embeds.device
         ).unsqueeze(0)
 
-        # print('input_ids', input_ids.shape, 'inputs_embeds', inputs_embeds.shape, 'position_ids', position_ids.shape, 'attention_mask', attention_mask.shape)
-        # embed positions
         hidden_states = inputs_embeds
 
         if attention_mask is None:
@@ -1479,7 +1469,6 @@ class TttForCausalLM(TttPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         assert not output_attentions, "output_attentions is not available in TttForCausalLM"
 
-        # print('input_ids', input_ids.shape)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1524,16 +1513,3 @@ class TttForCausalLM(TttPreTrainedModel):
             cache_params=outputs.cache_params,
             hidden_states=outputs.hidden_states,
         )
-
-
-if __name__ == "__main__":
-    from .configuration_ttt import TTT_STANDARD_CONFIGS
-    # 125M
-    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS["125m"])
-    ttt_model = TttForCausalLM(ttt_config)
-    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))
-    
-    # 1.3B
-    ttt_config = TttConfig(**TTT_STANDARD_CONFIGS["1b"])
-    ttt_model = TttForCausalLM(ttt_config)
-    print(ttt_model(torch.ones((1, 2048), dtype=torch.long)))
