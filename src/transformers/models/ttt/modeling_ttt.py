@@ -35,18 +35,31 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "TttConfig"
 
 
-def diff_gelu(x):
+# Modified from https://github.com/NVIDIA/Megatron-LM/blob/e33c8f78a35765d5aa37475a144da60e8a2349d1/megatron/core/fusions/fused_bias_gelu.py#L26
+def gelu_bwd(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
     return ff
 
 class TttCache:
-    def __init__(self, model, batch_size):
+    """
+    Arguments:
+        model: TttModel
+        batch_size: int
+    
+    Attributes:
+        seqlen_offset: int
+        inner_chunk_size: int 
+        params_dic: Dict[str, Dict[int, torch.Tensor]]  *_states, *_grad -> # layer_idx -> [batch_sise, ...]
+        conv_states_dic: Dict[str, Dict[int, torch.Tensor]]  *_states -> # layer_idx -> [batch_sise, ...]
+    
+    """
+    def __init__(self, model, batch_size: int):
         config = model.config
         self.seqlen_offset = 0
         self.inner_chunk_size = config.inner_net_chunk_size
 
-        self.params_dic = defaultdict(dict)
+        self.inner_params_dic = defaultdict(dict)
         if 'm1' in config.inner_net_type:
             self.inner_param_names = ["W1", "b1"]
         elif 'm2' in config.inner_net_type:
@@ -60,8 +73,10 @@ class TttCache:
             for name in self.inner_param_names:
                 weight = getattr(model.layers[layer_idx].self_attn, name)
                 tiled_weight = torch.tile(weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()).to(model.device)
-                self.params_dic[f"{name}_states"][layer_idx] = tiled_weight
-                self.params_dic[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
+                self.inner_params_dic[f"{name}_states"][layer_idx] = tiled_weight
+                # for decoding, we need to store the gradients as well
+                self.inner_params_dic[f"{name}_grad"][layer_idx] = torch.zeros_like(tiled_weight)
+
             if config.conv_before_ttt:
                 self.conv_states_dic["conv_before_ttt"][layer_idx] = torch.zeros(batch_size, config.hidden_size, config.conv_kernel, device=model.device)
             if config.use_mixer and config.share_qk:
@@ -70,24 +85,27 @@ class TttCache:
 
     def update(self, py_tree, layer_idx, seq_len):
         if seq_len % self.inner_chunk_size == 0:
+            # copy last chunk states, clear gradients
             for name in self.inner_param_names:
-                self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-                self.params_dic[f"{name}_grad"][layer_idx].zero_()
+                self.inner_params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
+                self.inner_params_dic[f"{name}_grad"][layer_idx].zero_()
         elif seq_len < self.inner_chunk_size:
             if seq_len != 1 and self.seqlen_offset > 0 and self.seqlen_offset % self.inner_chunk_size != 0:
                 raise ValueError("fractional update not supported yet.")
             if (seq_len + self.seqlen_offset) % self.inner_chunk_size == 0:
+                # copy last chunk states, clear gradients
                 for name in self.inner_param_names:
-                    self.params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
-                    self.params_dic[f"{name}_grad"][layer_idx].zero_()
+                    self.inner_params_dic[f"{name}_states"][layer_idx].copy_(py_tree[f"{name}_states"])
+                    self.inner_params_dic[f"{name}_grad"][layer_idx].zero_()
             else:
+                # copy gradients for the next update
                 for name in self.inner_param_names:
-                    self.params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
+                    self.inner_params_dic[f"{name}_grad"][layer_idx].copy_(py_tree[f"{name}_grad"])
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
 
     def to_dic(self, layer_idx):
-        return {name: self.params_dic[name][layer_idx] for name in self.params_dic}
+        return {name: self.inner_params_dic[name][layer_idx] for name in self.inner_params_dic}
 
 class TttRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -761,7 +779,7 @@ def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
     return z
 
 
-class TttM1BMMModule(TttBaseModule):
+class TttM1Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
@@ -920,7 +938,7 @@ class TttM1BMMModule(TttBaseModule):
         return XCW_batch, batch_params_dic
 
 
-class TttM2BMMModule(TttBaseModule):
+class TttM2Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
@@ -970,7 +988,7 @@ class TttM2BMMModule(TttBaseModule):
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
                 grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
                 # [B, nh, K, f]
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * gelu_bwd(Z1)
                 if self.config.transpose_ilr:
                     ilr_coeff_chunk = torch.broadcast_to(ilr_coeff_chunk, (*ilr_coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
@@ -1067,7 +1085,7 @@ class TttM2BMMModule(TttBaseModule):
                 ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
 
                 grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * diff_gelu(Z1)
+                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * gelu_bwd(Z1)
 
                 Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
                 b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
@@ -1136,9 +1154,9 @@ class TttDecoderLayer(nn.Module):
         self.conv_before_ttt = config.conv_before_ttt
 
         if config.inner_net_type == "m1":
-            ttt_module = TttM1BMMModule
+            ttt_module = TttM1Module
         elif config.inner_net_type == "m2":
-            ttt_module = TttM2BMMModule
+            ttt_module = TttM2Module
         else:
             raise ValueError(f"Invalid inner_net_type: {config.inner_net_type}")
 
