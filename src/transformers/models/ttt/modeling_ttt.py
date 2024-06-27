@@ -19,7 +19,6 @@ from ...modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import ALL_LAYERNORM_LAYERS
 from ...utils import ModelOutput, logging
 from ...utils.import_utils import is_causal_conv1d_available
 from .configuration_ttt import TttConfig
@@ -104,13 +103,14 @@ class TttCache:
         else:
             raise ValueError(f"seq_len {seq_len} is a partial update not supported yet")
 
-    def to_dic(self, layer_idx):
+    def inner_params_to_dic(self, layer_idx):
         return {name: self.inner_params_dic[name][layer_idx] for name in self.inner_params_dic}
 
+# Copied from transformers.models.llama.modeling_llama with Llama->Ttt
 class TttRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        TttRMSNorm is equivalent to T5LayerNorm
+        TttRMSNorm is equivalent to T5LayerNorm and LlamaRMSNorm.
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -124,10 +124,13 @@ class TttRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-ALL_LAYERNORM_LAYERS.append(TttRMSNorm)
-
+# Copied from transformers.models.llama.modeling_llama with Llama->Ttt
 class TttRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(self, dim, max_position_embeddings=16, base=10000, device=None, scaling_factor=1.0):
+        """
+        TttRotary is equivalent to LlamaLayerLlamaRotaryEmbedding in implementation, except TTT sets max_position_embedding to inner_chunk_size.
+        """
+
         super().__init__()
         self.scaling_factor = scaling_factor
         self.dim = dim
@@ -135,31 +138,6 @@ class TttRotaryEmbedding(nn.Module):
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        # For BC we register cos and sin cached
-        self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
-        t = t / self.scaling_factor
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_cos_cached", emb.cos().to(torch.get_default_dtype()), persistent=False)
-        self.register_buffer("_sin_cached", emb.sin().to(torch.get_default_dtype()), persistent=False)
-
-    @property
-    def sin_cached(self):
-        logger.warning_once(
-            "The sin_cached attribute will be removed in 4.39. Bear in mind that its contents changed in v4.38. Use "
-            "the forward method of RoPE from now on instead. It is not used in the `LlamaAttention` class"
-        )
-        return self._sin_cached
-
-    @property
-    def cos_cached(self):
-        logger.warning_once(
-            "The cos_cached attribute will be removed in 4.39. Bear in mind that its contents changed in v4.38. Use "
-            "the forward method of RoPE from now on instead. It is not used in the `LlamaAttention` class"
-        )
-        return self._cos_cached
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -178,35 +156,6 @@ class TttRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class TttLinearScalingRotaryEmbedding(TttRotaryEmbedding):
-    """TttRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
-
-    def forward(self, x, position_ids):
-        # difference to the original RoPE: a scaling factor is aplied to the position ids
-        position_ids = position_ids.float() / self.scaling_factor
-        cos, sin = super().forward(x, position_ids)
-        return cos, sin
-
-
-class TttDynamicNTKScalingRotaryEmbedding(TttRotaryEmbedding):
-    """TttRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
-
-    def forward(self, x, position_ids):
-        # difference to the original RoPE: inv_freq is recomputed when the sequence length > original length
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_position_embeddings:
-            base = self.base * (
-                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
-            ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: this may break with compilation
-
-        cos, sin = super().forward(x, position_ids)
-        return cos, sin
-
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -214,8 +163,11 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# https://github.com/young-geng/EasyLM/blob/main/EasyLM/models/llama/convert_easylm_to_hf.py#L141
 def permute_qk(q, k):
+    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
+    # we manually reorder the dim here to match our JAX implementation
+    # which may not be optimal for speed 
+    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
     bsz, num_head, seq_len, head_dim = q.shape
     q = q.reshape(bsz, num_head, seq_len, head_dim//2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
     k = k.reshape(bsz, num_head, seq_len, head_dim//2, 2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
@@ -223,6 +175,10 @@ def permute_qk(q, k):
     return q, k
 
 def undo_permute_qk(q, k):
+    # NOTE: EasyLM and transformers use different method to compute rotary emebdding
+    # we manually undo the reorder the dim here to match our JAX implementation
+    # which may not be optimal for speed 
+    # reference: https://github.com/young-geng/EasyLM/blob/981a2ed9630f44258a94b6f44dff2b7bd203ae8d/EasyLM/models/llama/convert_hf_to_easylm.py#L33
     bsz, num_head, seq_len, head_dim = q.shape
     q = q.reshape(bsz, num_head, seq_len, 2, head_dim//2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
     k = k.reshape(bsz, num_head, seq_len, 2, head_dim//2).transpose(3, 4).reshape(bsz, num_head, seq_len, head_dim)
@@ -256,8 +212,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+# Copied from transformers.models.llama.modeling_llama with Llama->Ttt
 class TttMLP(nn.Module):
     def __init__(self, config):
+        """
+        TttMLP is equivalent to LlamaMLP.
+        """
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -358,22 +318,6 @@ class TttConv(nn.Module):
 
         return hidden_states
 
-# Function to unpack tensors along the first dimension
-def unpack_tensors(tensor_dict):
-    # Determine the number of items to unpack (length of first dimension)
-    num_items = next(iter(tensor_dict.values())).shape[0]
-
-    # Initialize a list to hold the unpacked dictionaries
-    unpacked_list = []
-
-    for i in range(num_items):
-        # Create a new dictionary for each item, slicing each tensor along the first dimension
-        item_dict = {key: tensor[i].clone() for key, tensor in tensor_dict.items()}
-        unpacked_list.append(item_dict)
-
-    return unpacked_list
-
-
 def scan(f, init, xs, out, checkpoint_group=0):
     """Minic jax.lax.scan function."""
     carry = init
@@ -417,16 +361,24 @@ class TttBaseModule(nn.Module):
         self.head_dim = self.width // self.num_heads
         self.inner_chunk_size = config.inner_net_chunk_size
 
+        # token_idx is a scale factor that scale the summation in Eqn. 4
         token_idx = 1.0 / torch.arange(1, self.inner_chunk_size + 1)
         self.register_buffer("token_idx", token_idx, persistent=False)
+        # make the scale factor learnable
+        self.use_learnable_token_idx = config.use_learnable_token_idx
+        if self.use_learnable_token_idx:
+            self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size,)))
+
 
         self.share_qk = config.share_qk
         self.conv_kernel = config.conv_kernel
         self._init_qkvo_proj()
         self._init_rope()
+        # Learnable eta in Sec. 2.7
         self._init_gated_ilr()
         self._init_decoder_ln()
 
+        # use gating as in Mamba backbone
         self.use_mixer = config.use_mixer
         if self.use_mixer:
             self.g_proj = nn.Linear(self.width, self.width, bias=False)
@@ -439,17 +391,15 @@ class TttBaseModule(nn.Module):
         else:
             self.out_ln = nn.Identity()
         
-        self.use_learnable_token_idx = config.use_learnable_token_idx
-        if self.use_learnable_token_idx:
-            self.learnable_token_idx = nn.Parameter(torch.zeros((self.inner_chunk_size,)))
-
     def _init_qkvo_proj(self):
         self.q_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
+        # we share Q/K projection when using Mamba backbone
         if not self.share_qk:
             self.k_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.width, self.num_heads * self.head_dim, bias=False)
 
+        # after share Q/K projection, we use different conv layers for Q and K
         if self.share_qk:
             self.conv_q = nn.Conv1d(
                 self.hidden_size,
@@ -470,36 +420,16 @@ class TttBaseModule(nn.Module):
 
     def _init_rope(self):
         self.rope_theta = self.config.rope_theta
-        if self.config.rope_scaling is None:
-            self.rotary_emb = TttRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.inner_chunk_size,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = TttLinearScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.inner_chunk_size,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = TttDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.inner_chunk_size,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.rotary_emb = TttRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.inner_chunk_size,
+            base=self.rope_theta,
+        )
 
     def _init_gated_ilr(self):
-        # prepending head dim
+        # [width, 1]
         linear_weight_data = nn.Linear(self.width, 1, bias=True).weight.data
-        # [num_heads, width, 1]
+        # prepending head dim -> [num_heads, width, 1]
         self.linear_weight = nn.Parameter(
             torch.stack([torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(self.num_heads)], dim=0)
         )
@@ -511,9 +441,8 @@ class TttBaseModule(nn.Module):
         )
 
     def _init_decoder_ln(self):
-        self.decoder_ln_fn = partial(F.layer_norm, normalized_shape=[self.head_dim], eps=1e-6)
-        # prepending head dim
         ln_weight_data = nn.LayerNorm(self.head_dim).weight.data
+        # prepending head dim -> [num_heads, width]
         self.ln_weight = nn.Parameter(torch.tile(ln_weight_data.unsqueeze(0), (self.num_heads, 1)))
         ln_bias_data = nn.LayerNorm(self.head_dim).bias.data
         self.ln_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (self.num_heads, 1)))
@@ -617,7 +546,7 @@ class TttBaseModule(nn.Module):
     def get_coeff(self, X, inner_chunk_step_offset, inner_chunk_size):
         # [B, num_heads, n_chunk, inner_chunk_size, 1]
         ilr_gated = torch.einsum('bnkc,hdc->bhnkd', X, self.linear_weight) + self.linear_bias.reshape(1, -1, 1, 1, 1)
-        ilr_gated = ACT2FN[self.config.inner_net_gate_activation](ilr_gated)
+        ilr_gated = F.sigmoid(ilr_gated)
 
         if self.config.transpose_ilr:
             # [B, num_heads, n_chunk, 1, inner_chunk_size]
@@ -667,7 +596,7 @@ class TttBaseModule(nn.Module):
             inner_chunk_step_offset = 0
         token_coeff, ilr_coeff = self.get_coeff(X, inner_chunk_step_offset, inner_chunk_size)
         coeff = token_coeff * ilr_coeff
-        # disentangle token_coeff and ilr_coeff for decoding
+        # decouple token_coeff and ilr_coeff for decoding
         inputs = {'XQ': XQ, 'XK': XK, 'XV': XV, 'coeff': coeff, 'token_coeff': token_coeff, 'ilr_coeff': ilr_coeff}
         return inputs
 
@@ -737,6 +666,7 @@ class TttBaseModule(nn.Module):
 
 
 def ln_fwd(x, gamma, beta, eps=1e-6):
+    "Batch forward for LayerNorm."
 
     # Mean and variance computation
     mu = x.mean(dim=-1, keepdim=True)
@@ -752,6 +682,7 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
     return y
 
 def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
+    "Batch backward for LayerNorm fused with L2 loss."
     D = x.shape[-1]
 
     # Mean and variance computation
@@ -793,7 +724,7 @@ class TttM1Module(TttBaseModule):
 
         # in this case, we are decoding
         if last_chunk_params_dic is None and cache_params is not None:
-            last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
+            last_chunk_params_dic = cache_params.inner_params_to_dic(self.layer_idx)
 
         B = inputs['XV'].shape[0]  # [B, nh, NC, CS, f]
         num_chunks = inputs['XV'].shape[2]
@@ -954,7 +885,7 @@ class TttM2Module(TttBaseModule):
 
         # in this case, we are decoding
         if last_chunk_params_dic is None and cache_params is not None:
-            last_chunk_params_dic = cache_params.to_dic(self.layer_idx)
+            last_chunk_params_dic = cache_params.inner_params_to_dic(self.layer_idx)
 
         B = inputs['XV'].shape[0]  # [B, nh, NC, CS, f]
         num_chunks = inputs['XV'].shape[2]
@@ -962,7 +893,7 @@ class TttM2Module(TttBaseModule):
         device = inputs['XV'].device
         dtype = inputs['XV'].dtype
         if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
-            # @xinhao: decoding
+            # decoding with primal form
             def compute_chunk(params_dic, inputs):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
                 b1_init = params_dic["b1_states"]  # [B,nh,1,f]
@@ -1061,6 +992,7 @@ class TttM2Module(TttBaseModule):
                 return last_param_dic, XCW_chunk
 
         else:
+            # prefill with dual form
             def compute_chunk(params_dic, inputs):
                 W1_init = params_dic["W1_states"]  # [B,nh,f,f]
                 b1_init = params_dic["b1_states"]  # [B,nh,1,f]

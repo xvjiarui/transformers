@@ -149,7 +149,6 @@ class TttConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=True,
         rope_theta=10000.0,
-        rope_scaling=None,
         use_mixer=False,
         share_qk=False,
         inner_net_type='m1',
@@ -159,7 +158,6 @@ class TttConfig(PretrainedConfig):
         inner_net_on_residual=False,
         conv_before_ttt=False,
         conv_kernel=4,
-        inner_net_gate_activation="sigmoid",
         transpose_ilr=False,
         use_learnable_token_idx=False,
         use_out_ln=False,
@@ -179,8 +177,6 @@ class TttConfig(PretrainedConfig):
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self._rope_scaling_validation()
 
         self.use_mixer = use_mixer
         self.share_qk = share_qk
@@ -192,7 +188,6 @@ class TttConfig(PretrainedConfig):
         self.inner_net_on_residual = inner_net_on_residual
         self.conv_before_ttt = conv_before_ttt
         self.conv_kernel = conv_kernel
-        self.inner_net_gate_activation = inner_net_gate_activation
         self.use_learnable_token_idx = use_learnable_token_idx
         self.transpose_ilr = transpose_ilr
         self.use_out_ln = use_out_ln
@@ -205,23 +200,3 @@ class TttConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-    def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
-        if self.rope_scaling is None:
-            return
-
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
-            raise ValueError(
-                "`rope_scaling` must be a dictionary with two fields, `type` and `factor`, " f"got {self.rope_scaling}"
-            )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
-            raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
-            )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
-            raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
