@@ -627,6 +627,9 @@ class TttBaseModule(nn.Module):
         XQ, XK = undo_permute_qk(XQ, XK)
 
         output_hidden_states = []
+        # when input sequence length is not a multiple of inner_chunk_size
+        # we need to compute them seperately, when computing the reminder, 
+        # we will need the last_chunk_params_dic to continue inner loop learning
         if num_chunks > 0:
             inputs = {
                 "XQ": XQ[:, :, : num_chunks * self.inner_chunk_size],
@@ -714,11 +717,12 @@ def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
 class TttM1Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
+        # inner loop weight matrix initialization for TTT-Linear
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim)))
+        # inner loop bias initialization
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
     def process_inner_loop(self, inputs, inner_chunk_size, last_chunk_params_dic, cache_params: Optional[TttCache]=None):
-        # @xinhao: decoding from a prompt of length 1 will always have `inner_chunk_size=remainder=1`
         if inner_chunk_size is None:
             inner_chunk_size = self.inner_chunk_size
 
@@ -732,29 +736,45 @@ class TttM1Module(TttBaseModule):
         device = inputs['XV'].device
         dtype = inputs['XV'].dtype
 
-        if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
-            # @xinhao: decoding
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+        # NOTE: 
+        # for prefilling, we will always use dual form for faster computation
+        # we need to use primal form if inner_chunk_size is not a multiple of self.inner_chunk_size
+        # since we need store the gradient for the next mini-batch computation
+        use_dual_form = cache_params is None or inner_chunk_size % self.inner_chunk_size == 0
 
-                XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
-                XB_chunk = inputs["XK"]
-                XC_chunk = inputs["XQ"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
-                token_coeff_chunk = inputs["token_coeff"]
-                ilr_coeff_chunk = inputs["ilr_coeff"]
+        def compute_chunk(params_dic, inputs):
+            W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+            b1_init = params_dic["b1_states"]  # [B,nh,1,f]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-                if self.inner_net_on_residual:
-                    reconstruction_target = XA_chunk - XB_chunk
-                else:
-                    reconstruction_target = XA_chunk
+            XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
+            XB_chunk = inputs["XK"]
+            XC_chunk = inputs["XQ"]
+            coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+            token_coeff_chunk = inputs["token_coeff"]
+            ilr_coeff_chunk = inputs["ilr_coeff"]
 
-                ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
-                ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
-                grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+            X1 = XB_chunk
+            Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+            if self.inner_net_on_residual:
+                reconstruction_target = XA_chunk - XB_chunk
+            else:
+                reconstruction_target = XA_chunk
+
+            ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
+            ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
+            grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+
+            if use_dual_form:
+                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
+                b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
+                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+
+                last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
+                W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
+                grad_W1_last = torch.zeros_like(W1_last)
+                grad_b1_last = torch.zeros_like(b1_last)
+            else:
                 if self.config.transpose_ilr:
                     ilr_coeff_chunk = torch.broadcast_to(ilr_coeff_chunk, (*ilr_coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
@@ -778,73 +798,28 @@ class TttM1Module(TttBaseModule):
 
                 # [B, nh, K, 1, f] @ [B, nh, K, f, f]
                 Z1_bar = (XC_chunk.unsqueeze(3) @ W1_bar).squeeze(3) + b1_bar
-                
-                if self.use_post_ln:
-                    Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
-
-                if self.inner_net_on_residual:
-                    XCW_chunk = XC_chunk + Z1_bar
-                else:
-                    XCW_chunk = Z1_bar
 
                 W1_last = W1_bar[:, :, -1]
                 b1_last = b1_bar[:, :, -1:]
                 grad_W1_last = grad_W1[:, :, -1]
                 grad_b1_last = grad_b1[:, :, -1:]
 
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                    "W1_grad": grad_W1_last,
-                    "b1_grad": grad_b1_last,
-                }
-                return last_param_dic, XCW_chunk
+            
+            if self.use_post_ln:
+                Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
 
-        else:
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+            if self.inner_net_on_residual:
+                XCW_chunk = XC_chunk + Z1_bar
+            else:
+                XCW_chunk = Z1_bar
 
-                XA_chunk = inputs["XV"]  # [B,nh,K,f]
-                XB_chunk = inputs["XK"]
-                XC_chunk = inputs["XQ"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K,K]
-                coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
-
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
-                if self.config.inner_net_on_residual:
-                    reconstruction_target = XA_chunk - XB_chunk
-                else:
-                    reconstruction_target = XA_chunk
-
-                ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
-                ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
-
-                grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
-
-                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
-                b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-
-                if self.use_post_ln:
-                    Z1_bar = ln_fwd(Z1_bar, ln_weight, ln_bias)
-                if self.inner_net_on_residual:
-                    XCW_chunk = XC_chunk + Z1_bar
-                else:
-                    XCW_chunk = Z1_bar
-
-                last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
-                W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
-
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                    "W1_grad": torch.zeros_like(W1_init),
-                    "b1_grad": torch.zeros_like(b1_init),
-                }
-                return last_param_dic, XCW_chunk
+            last_param_dic = {
+                "W1_states": W1_last,
+                "b1_states": b1_last,
+                "W1_grad": grad_W1_last,
+                "b1_grad": grad_b1_last,
+            }
+            return last_param_dic, XCW_chunk
 
         if last_chunk_params_dic is not None:
             init_params_dic = last_chunk_params_dic
@@ -873,6 +848,7 @@ class TttM1Module(TttBaseModule):
 class TttM2Module(TttBaseModule):
     def __init__(self, config: TttConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
+        # inner loop weight matrix initialization for TTT-MLP
         self.W1 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, 4 * self.head_dim)))
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, 4 * self.head_dim))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
@@ -892,35 +868,61 @@ class TttM2Module(TttBaseModule):
         L = inputs['XV'].shape[2] * inputs['XV'].shape[3]
         device = inputs['XV'].device
         dtype = inputs['XV'].dtype
-        if cache_params is not None and inner_chunk_size % self.inner_chunk_size != 0:
-            # decoding with primal form
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
-                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
-                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+        # NOTE: 
+        # for prefilling, we will always use dual form for faster computation
+        # we need to use primal form if inner_chunk_size is not a multiple of self.inner_chunk_size
+        # since we need store the gradient for the next mini-batch computation
+        use_dual_form = cache_params is None or inner_chunk_size % self.inner_chunk_size == 0
 
-                XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
-                XB_chunk = inputs["XK"]
-                XC_chunk = inputs["XQ"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
-                token_coeff_chunk = inputs["token_coeff"]
-                ilr_coeff_chunk = inputs["ilr_coeff"]
+        def compute_chunk(params_dic, inputs):
+            W1_init = params_dic["W1_states"]  # [B,nh,f,f]
+            b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+            W2_init = params_dic["W2_states"]  # [B,nh,f,f]
+            b2_init = params_dic["b2_states"]  # [B,nh,1,f]
 
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
-                X2 = F.gelu(Z1, approximate='tanh')
-                Z2 = X2 @ W2_init + b2_init
-                if self.inner_net_on_residual:
-                    reconstruction_target = XA_chunk - XB_chunk
-                else:
-                    reconstruction_target = XA_chunk
+            XA_chunk = inputs["XV"]  # [B,nh,K=1,f]
+            XB_chunk = inputs["XK"]
+            XC_chunk = inputs["XQ"]
+            coeff_chunk = inputs["coeff"]  # [B,nh,K=1,1]
+            token_coeff_chunk = inputs["token_coeff"]
+            ilr_coeff_chunk = inputs["ilr_coeff"]
 
-                ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
-                ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
-                grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
-                # [B, nh, K, f]
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * gelu_bwd(Z1)
+            X1 = XB_chunk
+            Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+            X2 = F.gelu(Z1, approximate='tanh')
+            Z2 = X2 @ W2_init + b2_init
+            if self.inner_net_on_residual:
+                reconstruction_target = XA_chunk - XB_chunk
+            else:
+                reconstruction_target = XA_chunk
+
+            ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
+            ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
+            grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+            # [B, nh, K, f]
+            grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * gelu_bwd(Z1)
+
+            if use_dual_form:
+                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
+                b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
+                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                X2_bar = F.gelu(Z1_bar, approximate='tanh')
+
+                Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
+                b2_bar = b2_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z2  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+
+                last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
+                W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
+                W2_last = W2_init - (last_coeff_chunk * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                b2_last = b2_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
+                grad_W1_last = torch.zeros_like(W1_last)
+                grad_b1_last = torch.zeros_like(b1_last)
+                grad_W2_last = torch.zeros_like(W2_last)
+                grad_b2_last = torch.zeros_like(b2_last)
+
+            else:
                 if self.config.transpose_ilr:
                     ilr_coeff_chunk = torch.broadcast_to(ilr_coeff_chunk, (*ilr_coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
 
@@ -961,14 +963,6 @@ class TttM2Module(TttBaseModule):
                 Z1_bar = (XC_chunk.unsqueeze(3) @ W1_bar).squeeze(3) + b1_bar
                 X2_bar = F.gelu(Z1_bar, approximate='tanh')
                 Z2_bar = (X2_bar.unsqueeze(3) @ W2_bar).squeeze(3) + b2_bar
-                
-                if self.use_post_ln:
-                    Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
-
-                if self.inner_net_on_residual:
-                    XCW_chunk = XC_chunk + Z2_bar
-                else:
-                    XCW_chunk = Z2_bar
 
                 W1_last = W1_bar[:, :, -1]
                 b1_last = b1_bar[:, :, -1:]
@@ -978,80 +972,26 @@ class TttM2Module(TttBaseModule):
                 grad_b1_last = grad_b1[:, :, -1:]
                 grad_W2_last = grad_W2[:, :, -1]
                 grad_b2_last = grad_b2[:, :, -1:]
+            
+            if self.use_post_ln:
+                Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
 
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                    "W2_states": W2_last,
-                    "b2_states": b2_last,
-                    "W1_grad": grad_W1_last,
-                    "b1_grad": grad_b1_last,
-                    "W2_grad": grad_W2_last,
-                    "b2_grad": grad_b2_last,
-                }
-                return last_param_dic, XCW_chunk
+            if self.inner_net_on_residual:
+                XCW_chunk = XC_chunk + Z2_bar
+            else:
+                XCW_chunk = Z2_bar
 
-        else:
-            # prefill with dual form
-            def compute_chunk(params_dic, inputs):
-                W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-                b1_init = params_dic["b1_states"]  # [B,nh,1,f]
-                W2_init = params_dic["W2_states"]  # [B,nh,f,f]
-                b2_init = params_dic["b2_states"]  # [B,nh,1,f]
-
-                XA_chunk = inputs["XV"]  # [B,nh,K,f]
-                XB_chunk = inputs["XK"]
-                XC_chunk = inputs["XQ"]
-                coeff_chunk = inputs["coeff"]  # [B,nh,K,K]
-                coeff_chunk = torch.broadcast_to(coeff_chunk, (*coeff_chunk.shape[:2], inner_chunk_size, inner_chunk_size))
-
-                X1 = XB_chunk
-                Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [1,nh,f,f] + [B,nh,1,f] -> [B,nh,K,f]
-                X2 = F.gelu(Z1, approximate='tanh')
-                Z2 = X2 @ W2_init + b2_init
-                if self.config.inner_net_on_residual:
-                    reconstruction_target = XA_chunk - XB_chunk
-                else:
-                    reconstruction_target = XA_chunk
-
-                ln_weight = self.ln_weight.reshape(self.num_heads, 1, self.head_dim)
-                ln_bias = self.ln_bias.reshape(self.num_heads, 1, self.head_dim)
-
-                grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
-                grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2,-1) * gelu_bwd(Z1)
-
-                Attn1 = torch.tril(XC_chunk @ X1.transpose(-2,-1))  # [B,nh,K,K]
-                b1_bar = b1_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z1  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = XC_chunk @ W1_init - (coeff_chunk * Attn1) @ grad_l_wrt_Z1 + b1_bar  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                X2_bar = F.gelu(Z1_bar, approximate='tanh')
-
-                Attn2 = torch.tril(X2_bar @ X2.transpose(-2,-1))  # [B,nh,K,K]
-                b2_bar = b2_init - torch.tril(coeff_chunk) @ grad_l_wrt_Z2  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z2_bar = X2_bar @ W2_init - (coeff_chunk * Attn2) @ grad_l_wrt_Z2 + b2_bar  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
-                if self.use_post_ln:
-                    Z2_bar = ln_fwd(Z2_bar, ln_weight, ln_bias)
-                if self.inner_net_on_residual:
-                    XCW_chunk = XC_chunk + Z2_bar
-                else:
-                    XCW_chunk = Z2_bar
-
-                last_coeff_chunk = coeff_chunk[:, :, -1, :, None]
-                W1_last = W1_init - (last_coeff_chunk * X1).transpose(-1,-2) @ grad_l_wrt_Z1  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
-                W2_last = W2_init - (last_coeff_chunk * X2).transpose(-1,-2) @ grad_l_wrt_Z2  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b2_last = b2_init - torch.sum(last_coeff_chunk * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
-
-                last_param_dic = {
-                    "W1_states": W1_last,
-                    "b1_states": b1_last,
-                    "W2_states": W2_last,
-                    "b2_states": b2_last,
-                    "W1_grad": torch.zeros_like(W1_init),
-                    "b1_grad": torch.zeros_like(b1_init),
-                    "W2_grad": torch.zeros_like(W2_init),
-                    "b2_grad": torch.zeros_like(b2_init),
-                }
-                return last_param_dic, XCW_chunk
+            last_param_dic = {
+                "W1_states": W1_last,
+                "b1_states": b1_last,
+                "W2_states": W2_last,
+                "b2_states": b2_last,
+                "W1_grad": grad_W1_last,
+                "b1_grad": grad_b1_last,
+                "W2_grad": grad_W2_last,
+                "b2_grad": grad_b2_last,
+            }
+            return last_param_dic, XCW_chunk
 
         if last_chunk_params_dic is not None:
             init_params_dic = last_chunk_params_dic
