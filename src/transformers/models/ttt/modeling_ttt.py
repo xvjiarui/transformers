@@ -389,12 +389,13 @@ def scan(f, init, xs, out, checkpoint_group=0):
                 x = [x[i] for x in xs]
             carry, y = f(carry, x)
             out[i] = y
+        return carry
     if checkpoint_group > 0:
         ckpt_every_n = num_items // checkpoint_group
-        for i in range(0, num_items, ckpt_every_n):
-            torch.utils.checkpoint.checkpoint(scan_fn, carry, i, min(i + ckpt_every_n, num_items), use_reentrant=False)
+        for k in range(0, num_items, ckpt_every_n):
+            carry = torch.utils.checkpoint.checkpoint(scan_fn, carry, k, min(k + ckpt_every_n, num_items), use_reentrant=False)
     else:
-        scan_fn(carry, 0, num_items)
+        carry = scan_fn(carry, 0, num_items)
 
     return carry, out
 
