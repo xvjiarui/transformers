@@ -868,7 +868,7 @@ _import_structure = {
         "TrOCRConfig",
         "TrOCRProcessor",
     ],
-    "models.ttt": ["TTTConfig"],
+    "models.ttt": ["TttConfig"],
     "models.tvlt": [
         "TVLT_PRETRAINED_CONFIG_ARCHIVE_MAP",
         "TvltConfig",

@@ -151,7 +151,7 @@ class TttConfig(PretrainedConfig):
         rope_theta=10000.0,
         use_mixer=False,
         share_qk=False,
-        inner_net_type='m1',
+        inner_net_type="m1",
         inner_net_lr=1.0,
         inner_net_chunk_size=16,
         use_post_ln=False,
