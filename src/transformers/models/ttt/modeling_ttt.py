@@ -12,7 +12,6 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.utils._pytree import tree_map
 
-from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -21,7 +20,9 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, logging
 from transformers.utils.import_utils import is_causal_conv1d_available
+
 from .configuration_ttt import TTTConfig
+
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -31,10 +32,11 @@ else:
 
 logger = logging.get_logger(__name__)
 
+
 class TTTCache:
     """
     TTTCache is a data structure that holds the last hidden states and gradients for the inner loop of TTT model.
-    
+
     Arguments:
         model: TTTModel
         batch_size: int
@@ -516,7 +518,9 @@ class TTTBaseModule(nn.Module):
 
     def get_eta(self, X, mini_batch_step_offset, mini_batch_size):
         # [B, num_heads, num_mini_batch, mini_batch_size, 1]
-        ttt_lr = torch.einsum("bnkc,hdc->bhnkd", X, self.learnable_ttt_lr_weight) + self.learnable_ttt_lr_bias.reshape(1, -1, 1, 1, 1)
+        ttt_lr = torch.einsum("bnkc,hdc->bhnkd", X, self.learnable_ttt_lr_weight) + self.learnable_ttt_lr_bias.reshape(
+            1, -1, 1, 1, 1
+        )
         ttt_lr = F.sigmoid(ttt_lr)
 
         # [B, num_heads, num_mini_batch, 1, mini_batch_size]
@@ -570,10 +574,8 @@ class TTTBaseModule(nn.Module):
         inputs = {"XQ": XQ, "XK": XK, "XV": XV, "eta": eta, "token_eta": token_eta, "ttt_lr_eta": ttt_lr_eta}
         return inputs
 
-    def ttt(
-        self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None
-    ):
-        raise NotImplementedError("process_mini_batch method must be implemented in TTTBaseModule subclasses.")
+    def ttt(self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None):
+        raise NotImplementedError("ttt method must be implemented in TTTBaseModule subclasses.")
 
     def forward(
         self,
@@ -705,9 +707,7 @@ class TTTLinearModule(TTTBaseModule):
         # inner loop bias initialization
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def ttt(
-        self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None
-    ):
+    def ttt(self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None):
         if mini_batch_size is None:
             mini_batch_size = self.mini_batch_size
 
@@ -715,7 +715,8 @@ class TTTLinearModule(TTTBaseModule):
         if last_mini_batch_params_dic is None and cache_params is not None:
             last_mini_batch_params_dic = cache_params.inner_params_to_dic(self.layer_idx)
 
-        B = inputs["XV"].shape[0]  # [B, nh, NC, CS, f]
+        # [B, num_heads, num_mini_batch, mini_batch_size, head_dim]
+        B = inputs["XV"].shape[0]
         num_mini_batch = inputs["XV"].shape[2]
         L = inputs["XV"].shape[2] * inputs["XV"].shape[3]
         device = inputs["XV"].device
@@ -728,39 +729,43 @@ class TTTLinearModule(TTTBaseModule):
         use_dual_form = cache_params is None or mini_batch_size % self.mini_batch_size == 0
 
         def compute_mini_batch(params_dic, inputs):
-            W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-            b1_init = params_dic["b1_states"]  # [B,nh,1,f]
+            # [B, nh, f, f], nh=num_heads, f=head_dim
+            W1_init = params_dic["W1_states"]
+            # [B, nh, 1, f]
+            b1_init = params_dic["b1_states"]
 
-            # [B,nh,K,f]
+            # [B,nh,K,f], K=mini_batch_size
             XQ_mini_batch = inputs["XQ"]
-            XV_mini_batch = inputs["XV"]  
+            XV_mini_batch = inputs["XV"]
             XK_mini_batch = inputs["XK"]
-            eta_mini_batch = inputs["eta"]  # [B,nh,K=1,1]
+            # [B, nh, K, 1]
+            eta_mini_batch = inputs["eta"]
             token_eta_mini_batch = inputs["token_eta"]
             ttt_lr_eta_mini_batch = inputs["ttt_lr_eta"]
 
             X1 = XK_mini_batch
-            Z1 = X1 @ W1_init + b1_init  # [B,nh,K=1,f] @ [B,nh,f,f] -> [B,nh,K=1,f]
+            # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
+            Z1 = X1 @ W1_init + b1_init
             reconstruction_target = XV_mini_batch - XK_mini_batch
 
             ln_weight = self.ttt_norm_weight.reshape(self.num_heads, 1, self.head_dim)
             ln_bias = self.ttt_norm_bias.reshape(self.num_heads, 1, self.head_dim)
-            grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+            # [B,nh,K,f]
+            grad_l_wrt_Z1 = ln_fused_l2_bwd(Z1, reconstruction_target, ln_weight, ln_bias)
 
             if use_dual_form:
-                Attn1 = torch.tril(XQ_mini_batch @ X1.transpose(-2, -1))  # [B,nh,K,K]
-                b1_bar = (
-                    b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
-                )  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = (
-                    XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
-                )  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                # [B,nh,K,K]
+                Attn1 = torch.tril(XQ_mini_batch @ X1.transpose(-2, -1))
+                # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
+                b1_bar = b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
+                # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
 
                 last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
-                W1_last = (
-                    W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
-                )  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
+                # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
+                # [B,nh,1,f]
+                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
                 grad_W1_last = torch.zeros_like(W1_last)
                 grad_b1_last = torch.zeros_like(b1_last)
             else:
@@ -808,7 +813,9 @@ class TTTLinearModule(TTTBaseModule):
             }
             init_params_dic.update(W1_grad=torch.zeros_like(init_params_dic["W1_states"]))
             init_params_dic.update(b1_grad=torch.zeros_like(init_params_dic["b1_states"]))
-        inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)  # [B,nh,NC,CS,f] -> [NC,B,nh,CS,f]
+
+        # [B,num_heads, num_mini_batch, mini_batch_size, f] -> [num_mini_batch, B, num_heads, mini_batch_size, f]
+        inputs = tree_map(lambda x: x.permute(2, 0, 1, 3, 4), inputs)
 
         # allocate output tensor
         XQW_batch = torch.empty(
@@ -839,10 +846,7 @@ class TTTMLPModule(TTTBaseModule):
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
 
-    def ttt(
-        self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None
-    ):
-        # @xinhao: decoding from a prompt of length 1 will always have `mini_batch_size=remainder=1`
+    def ttt(self, inputs, mini_batch_size, last_mini_batch_params_dic, cache_params: Optional[TTTCache] = None):
         if mini_batch_size is None:
             mini_batch_size = self.mini_batch_size
 
@@ -850,7 +854,8 @@ class TTTMLPModule(TTTBaseModule):
         if last_mini_batch_params_dic is None and cache_params is not None:
             last_mini_batch_params_dic = cache_params.inner_params_to_dic(self.layer_idx)
 
-        B = inputs["XV"].shape[0]  # [B, nh, NC, CS, f]
+        # [B, num_heads, num_mini_batch, mini_batch_size, head_dim]
+        B = inputs["XV"].shape[0]
         num_mini_batch = inputs["XV"].shape[2]
         L = inputs["XV"].shape[2] * inputs["XV"].shape[3]
         device = inputs["XV"].device
@@ -862,58 +867,62 @@ class TTTMLPModule(TTTBaseModule):
         use_dual_form = cache_params is None or mini_batch_size % self.mini_batch_size == 0
 
         def compute_mini_batch(params_dic, inputs):
-            W1_init = params_dic["W1_states"]  # [B,nh,f,f]
-            b1_init = params_dic["b1_states"]  # [B,nh,1,f]
-            W2_init = params_dic["W2_states"]  # [B,nh,f,f]
-            b2_init = params_dic["b2_states"]  # [B,nh,1,f]
+            # [B, nh, f, 4f]
+            W1_init = params_dic["W1_states"]
+            # [B, nh, 1, 4f]
+            b1_init = params_dic["b1_states"]
+            # [B, nh, 4f, f]
+            W2_init = params_dic["W2_states"]
+            # [B, nh, 1, f]
+            b2_init = params_dic["b2_states"]
 
             # [B,nh,K,f]
             XQ_mini_batch = inputs["XQ"]
-            XV_mini_batch = inputs["XV"]  
+            XV_mini_batch = inputs["XV"]
             XK_mini_batch = inputs["XK"]
-            eta_mini_batch = inputs["eta"]  # [B,nh,K=1,1]
+            # [B,nh,K,1]
+            eta_mini_batch = inputs["eta"]
             token_eta_mini_batch = inputs["token_eta"]
             ttt_lr_eta_mini_batch = inputs["ttt_lr_eta"]
 
             X1 = XK_mini_batch
-            Z1 = X1 @ W1_init + b1_init  # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
+            # [B,nh,K,f] @ [B,nh,f,f] -> [B,nh,K,f]
+            Z1 = X1 @ W1_init + b1_init
             X2 = F.gelu(Z1, approximate="tanh")
             Z2 = X2 @ W2_init + b2_init
             reconstruction_target = XV_mini_batch - XK_mini_batch
 
             ln_weight = self.ttt_norm_weight.reshape(self.num_heads, 1, self.head_dim)
             ln_bias = self.ttt_norm_bias.reshape(self.num_heads, 1, self.head_dim)
-            grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)  # [B,nh,K,f]
+            # [B, nh, K, f]
+            grad_l_wrt_Z2 = ln_fused_l2_bwd(Z2, reconstruction_target, ln_weight, ln_bias)
             # [B, nh, K, f]
             grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2, -1) * gelu_bwd(Z1)
 
             if use_dual_form:
                 Attn1 = torch.tril(XQ_mini_batch @ X1.transpose(-2, -1))  # [B,nh,K,K]
-                b1_bar = (
-                    b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
-                )  # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
-                Z1_bar = (
-                    XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
-                )  # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                # [B,nh,1,f] - [B,nh,K,K] @ [B,nh,K,f] -> [B,nh,K,f]
+                b1_bar = b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
+                # [B,nh,K,f] @ [B,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
                 X2_bar = F.gelu(Z1_bar, approximate="tanh")
 
-                Attn2 = torch.tril(X2_bar @ X2.transpose(-2, -1))  # [B,nh,K,K]
-                b2_bar = (
-                    b2_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z2
-                )  # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
-                Z2_bar = (
-                    X2_bar @ W2_init - (eta_mini_batch * Attn2) @ grad_l_wrt_Z2 + b2_bar
-                )  # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                # [B,nh,K,K]
+                Attn2 = torch.tril(X2_bar @ X2.transpose(-2, -1))
+                # [B,nh,1,f] - [B,nh,K,1] * [B,nh,K,f] -> [B,nh,K,f]
+                b2_bar = b2_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z2
+                # [B,nh,K,f] @ [1,nh,f,f] - ([B,nh,K,1] * [B,nh,K,K]) @ [B,nh,K,f] + [B,nh,K,f]
+                Z2_bar = X2_bar @ W2_init - (eta_mini_batch * Attn2) @ grad_l_wrt_Z2 + b2_bar
 
                 last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
-                W1_last = (
-                    W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
-                )  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)  # [B,nh,1,f]
-                W2_last = (
-                    W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
-                )  # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
-                b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)  # [B,nh,1,f]
+                # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
+                # [B,nh,1,f]
+                b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
+                # [B,nh,f,f] - [B,nh,f,K] @ [B,nh,K,f]
+                W2_last = W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
+                # [B,nh,1,f]
+                b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)
                 grad_W1_last = torch.zeros_like(W1_last)
                 grad_b1_last = torch.zeros_like(b1_last)
                 grad_W2_last = torch.zeros_like(W2_last)
@@ -1393,6 +1402,7 @@ class TTTForCausalLM(TTTPreTrainedModel):
             cache_params=outputs.cache_params,
             hidden_states=outputs.hidden_states,
         )
+
 
 TttModel = TTTModel
 TttForCausalLM = TTTForCausalLM
