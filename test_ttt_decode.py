@@ -1,32 +1,11 @@
-import os
-import torch
 import time
-from transformers.models.ttt.modeling_ttt import TttConfig, TttForCausalLM
+from transformers.models.ttt.modeling_ttt import TttForCausalLM
 from transformers import AutoTokenizer, GenerationConfig
-TTT_STANDARD_CONFIGS = {
-    'debug': { # A small model for debugging
-        'vocab_size': 32000,
-        'hidden_size': 128,
-        'intermediate_size': 256,
-        'num_hidden_layers': 1,
-        'num_attention_heads': 4,
-        'max_sequence_length': 2048,
-        'initializer_range': 0.02,
-        'rms_norm_eps': 1e-6,
-        'use_cache': True,
-        'tie_word_embeddings': False,
-        'inner_net_lr': 1.,
-        'inner_net_chunk_size': 16,
-        'inner_net_intermediate_size': 128,
-    },
-}
 
-# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M1MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M1MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
+model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts_release/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_M1_Dual_out_norm_ln_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_1/hf_4800"
 # model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M1MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_1/hf_4800"
+# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts_release/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_M2_Dual_out_norm_ln_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
+# model_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts_release/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
 
 if __name__ == '__main__':
     print('loading', model_path)

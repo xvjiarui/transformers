@@ -28,29 +28,37 @@ logger = logging.get_logger(__name__)
 
 TTT_STANDARD_CONFIGS = {
     "1b": {
-        "vocab_size": 32000,
         "hidden_size": 2048,
         "intermediate_size": 5504,
         "num_hidden_layers": 24,
         "num_attention_heads": 32,
-        "rms_norm_eps": 1e-6,
     },
     "125m": {
-        "vocab_size": 32000,
         "hidden_size": 768,
         "intermediate_size": 2048,
         "num_hidden_layers": 12,
         "num_attention_heads": 12,
-        "rms_norm_eps": 1e-6,
+    },
+    "350m": {
+        "hidden_size": 1024,
+        "intermediate_size": 2736,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+    },
+    "760m": {
+        "hidden_size": 1536,
+        "intermediate_size": 4096,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
     },
 }
 
 
-class TttConfig(PretrainedConfig):
+class TTTConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
+    This is the configuration class to store the configuration of a [`TTTModel`]. It is used to instantiate an TTT
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the LLaMA-7B.
+    defaults will yield a similar configuration to that of the TTT-1B.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -111,19 +119,25 @@ class TttConfig(PretrainedConfig):
             these scaling strategies behave:
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
-        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
-            Whether to use a bias in the query, key, value and output projection layers during self-attention.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
+        use_gate (`bool`, *optional*, defaults to `False`): whether use gating in Mamba backbone
+        share_qk (`bool`, *optional*, defaults to `False`): whether share Q/K projection matrix
+        ttt_block_type (`str`, *optional*, defaults to `"linear"`): ttt block type, "linear" or "mlp", stands for TTT-Linear and TTT-MLP
+        ttt_base_lr (`float`, *optional*, defaults to 1.0): base learning rate for TTT learner
+        pre_conv (`bool`, *optional*, defaults to `False`): whether use conv before TTT
+        conv_kernel (`int`, *optional*, defaults to 4): kernel size of the conv layer
+        scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
+            gradient checkpoint group size on seq dimension, 0 means no checkpointing.
+            In JAX implementation, we set it 4, which means we group 4 mini-batches together in 1 gradient checkpointg to save memory.
+
 
     ```python
-    >>> from transformers import LlamaModel, LlamaConfig
+    >>> from . import TTTModel, TTTConfig
 
-    >>> # Initializing a LLaMA llama-7b style configuration
-    >>> configuration = LlamaConfig()
+    >>> # Initializing a TTT ttt-1b style configuration
+    >>> configuration = TTTConfig()
 
-    >>> # Initializing a model from the llama-7b style configuration
-    >>> model = LlamaModel(configuration)
+    >>> # Initializing a model from the ttt-1b style configuration
+    >>> model = TTTModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -144,24 +158,19 @@ class TttConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         use_cache=False,
         pad_token_id=None,
-        bos_token_id=0,
-        eos_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
         pretraining_tp=1,
         tie_word_embeddings=True,
         rope_theta=10000.0,
-        use_mixer=False,
+        use_gate=False,
         share_qk=False,
-        inner_net_type="m1",
-        inner_net_lr=1.0,
-        inner_net_chunk_size=16,
-        use_post_ln=False,
-        inner_net_on_residual=False,
-        conv_before_ttt=False,
+        ttt_block_type="linear",
+        ttt_base_lr=1.0,
+        mini_batch_size=16,
+        pre_conv=False,
         conv_kernel=4,
-        transpose_ilr=False,
-        use_learnable_token_idx=False,
-        use_out_ln=False,
-        scan_checkpoint_group=0,
+        scan_checkpoint_group_size=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -178,20 +187,15 @@ class TttConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
 
-        self.use_mixer = use_mixer
+        self.use_gate = use_gate
         self.share_qk = share_qk
-        self.inner_net_type = inner_net_type
-        self.inner_net_lr = inner_net_lr
-        self.inner_net_chunk_size = inner_net_chunk_size
+        self.ttt_block_type = ttt_block_type
+        self.ttt_base_lr = ttt_base_lr
+        self.mini_batch_size = mini_batch_size
 
-        self.use_post_ln = use_post_ln
-        self.inner_net_on_residual = inner_net_on_residual
-        self.conv_before_ttt = conv_before_ttt
+        self.pre_conv = pre_conv
         self.conv_kernel = conv_kernel
-        self.use_learnable_token_idx = use_learnable_token_idx
-        self.transpose_ilr = transpose_ilr
-        self.use_out_ln = use_out_ln
-        self.scan_checkpoint_group = scan_checkpoint_group
+        self.scan_checkpoint_group_size = scan_checkpoint_group_size
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -200,3 +204,6 @@ class TttConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+TttConfig = TTTConfig

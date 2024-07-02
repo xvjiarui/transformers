@@ -55,36 +55,8 @@ flax_args.llama_config_update = dict(
 pt_args = Dict()
 
 model_size = "125m-TTT"
-# flax_args.weight_path = "trainstate_params::/nlp/scr/yusun/data/jiarui/easylm_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/streaming_train_state_4800"
-# pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-# flax_args.llama_config_update = dict(
-#     inner_net="mlp_2_mixer_linear_dual",
-#     ilr=0.1,
-#     max_sequence_length=flax_args.seq_length,
-#     remat_chunk_group_size=1,
-#     use_rotary_emb="chunk",
-#     post_LN=use_post_ln,
-#     inner_net_on_residual=inner_net_on_residual,
-#     conv1d_before_attn=True,
-#     use_bmm=True,
-#     use_learnable_token_idx="fix",
-# )
-# flax_args.weight_path = "trainstate_params::/nlp/scr/yusun/data/jiarui/easylm_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/streaming_train_state_4800"
-# pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/05_15_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_bmm_share_qk_qk4_token_idx_fix_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
-# flax_args.llama_config_update = dict(
-#     inner_net="mlp_2_mixer_linear_dual",
-#     ilr=0.1,
-#     max_sequence_length=flax_args.seq_length,
-#     remat_chunk_group_size=1,
-#     use_rotary_emb="chunk",
-#     post_LN=use_post_ln,
-#     inner_net_on_residual=inner_net_on_residual,
-#     conv1d_before_attn=True,
-#     use_bmm=True,
-#     use_learnable_token_idx="fix_transpose",
-# )
 # flax_args.weight_path = "trainstate_params::/nlp/scr/yusun/data/jiarui/easylm_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_M2_Dual_out_norm_ln_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/streaming_train_state_4800"
-# pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_M2_Dual_out_norm_ln_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
+# pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts_release/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_M2_Dual_out_norm_ln_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
 # flax_args.llama_config_update = dict(
 #     inner_net="mlp_2_dual",
 #     ilr=0.1,
@@ -98,7 +70,7 @@ model_size = "125m-TTT"
 #     use_learnable_token_idx="learnable_row_transpose",
 # )
 flax_args.weight_path = "trainstate_params::/nlp/scr/yusun/data/jiarui/easylm_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/streaming_train_state_4800"
-pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
+pt_args.weight_path = "/nlp/scr/yusun/data/jiarui/easylm_to_hf_ckpts_release/LLAMA-125M/06_01_Tok_llama2_D_2.5B_ctx_2048_BS_256_c1d_k4_M2MixerLinear_Dual_out_norm_ln_share_qk_qk4_learnable_row_transpose_postln_res_chunk_rotary_lr_3e-3_ilr_sigmoid_0.01_480_to_0.1/hf_4800"
 flax_args.llama_config_update = dict(
     inner_net="mlp_2_mixer_linear_dual",
     ilr=0.1,
@@ -112,11 +84,7 @@ flax_args.llama_config_update = dict(
     use_learnable_token_idx="learnable_row_transpose",
 )
 pt_args.model_args = dict(
-    inner_net_type="m2",
-    inner_net_on_residual=inner_net_on_residual,
-    use_post_ln=use_post_ln,
 )
-# pt_args.model_args = dict(inner_net_type='m1_bmm', inner_net_on_residual=inner_net_on_residual, use_post_ln=use_post_ln)
 
 
 def forward_flax_token(input_tokens, input_mask):
